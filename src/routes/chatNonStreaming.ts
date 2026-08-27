@@ -1,5 +1,7 @@
 import { Context } from 'hono';
+import { decrementInFlight, pickAccount } from '../services/auth.ts';
 import { logStore } from '../services/logStore.ts';
+import { QwenUpstreamError, reportRateLimitWall } from '../services/qwen.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { detectParallelToolLoop } from '../tools/guard.ts';
 import type { Message, OpenAIRequest, ParsedToolCall } from '../types/openai.ts';
@@ -47,6 +49,9 @@ interface StreamProcessorState {
   completionTokens: number;
   promptTokens: number;
   nextParentId: string | null;
+  upstreamCode?: string;
+  upstreamWaitHours?: number;
+  upstreamErrorMessage?: string;
 }
 
 function buildPromptString(messages: Message[]): string {
@@ -162,6 +167,16 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
   if (chunk.error) {
     const errMsg = typeof chunk.error === 'string' ? chunk.error : chunk.error.message || JSON.stringify(chunk.error);
     logStore.addError(ctx.logId, `Qwen upstream SSE error: ${errMsg}`);
+    return;
+  }
+  if (chunk?.success === false) {
+    const code = chunk.data?.code || chunk.code || 'UpstreamError';
+    const details = chunk.data?.details || chunk.message || 'Qwen returned an error';
+    const wait = chunk.data?.num !== undefined ? ` Wait about ${chunk.data.num} hour(s) before trying again.` : '';
+    state.upstreamCode = code;
+    state.upstreamWaitHours = chunk.data?.num;
+    state.upstreamErrorMessage = `Qwen upstream error: ${code}: ${details}.${wait}`;
+    logStore.addError(ctx.logId, state.upstreamErrorMessage);
     return;
   }
   const deltaStatus = chunk.choices?.[0]?.delta?.status;
@@ -352,11 +367,25 @@ function buildResponseFromState(state: StreamProcessorState, ctx: NonStreamingCo
 async function processContentChunks(state: StreamProcessorState, ctx: NonStreamingContext): Promise<Response> {
   const { c, logId } = ctx;
 
-  const upstreamError = parseQwenErrorPayload(state.buffer);
-  if (upstreamError) {
+  const parsedError = parseQwenErrorPayload(state.buffer);
+  const errorCode = parsedError?.code ?? state.upstreamCode;
+  if (errorCode === 'RateLimited') {
+    reportRateLimitWall(ctx.resolvedEmail, ctx.body.model, parsedError?.waitHours ?? state.upstreamWaitHours);
+    const alternative = await pickAccount(ctx.resolvedEmail);
+    if (alternative) {
+      decrementInFlight(alternative.email);
+      logStore.log('warn', 'chat', `[Chat] Mid-body RateLimited on ${ctx.resolvedEmail} — rotating account`);
+      throw new QwenUpstreamError(
+        parsedError?.message ?? state.upstreamErrorMessage ?? 'Qwen upstream error: RateLimited',
+        'RateLimited',
+        429,
+      );
+    }
+  }
+  if (parsedError) {
     logStore.finalizeRequest(logId);
-    const cleanMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
-    return c.json({ error: { message: cleanMessage } }, upstreamError.status);
+    const cleanMessage = cleanTextOfXmlArtifacts(parsedError.message).cleanedText || parsedError.message;
+    return c.json({ error: { message: cleanMessage } }, parsedError.status);
   }
 
   flushAndDetectLoops(state, logId);

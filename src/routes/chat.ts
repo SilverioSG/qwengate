@@ -1,10 +1,10 @@
 import crypto from 'node:crypto';
 import { Context } from 'hono';
-import { pickAccount, throttleAccount } from '../services/auth.ts';
+import { decrementInFlight, pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
-import { RetryableQwenStreamError } from '../services/qwen.ts';
+import { QwenUpstreamError, RetryableQwenStreamError, reportRateLimitWall } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
 import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
@@ -18,6 +18,7 @@ import {
   createQwenStreamWithRetry,
   getModelSpecs,
   handleImageModelFallback,
+  parseQwenErrorPayload,
 } from './chatHelpers.ts';
 import { handleNonStreamingRequest } from './chatNonStreaming.ts';
 import { handleStreamingRequest } from './chatStreaming.ts';
@@ -28,6 +29,7 @@ export {
 } from './chatHelpers.ts';
 
 const MAX_MESSAGE_SIZE = 10_000_000; // 10MB — large payloads are uploaded as files via Qwen's file API
+const MAX_MID_BODY_RETRIES = 5;
 
 async function parseRequestBody(c: Context) {
   const rawBody = await c.req.json();
@@ -339,6 +341,31 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
     }
     clearTimeout(firstChunkTimer);
 
+    // Qwen can deliver a RateLimited envelope inside an HTTP 200 body/SSE.
+    // Before any bytes reach the client, throttle the account and rotate safely.
+    if (!firstChunk.done && firstChunk.value) {
+      const wall = parseQwenErrorPayload(new TextDecoder().decode(firstChunk.value));
+      if (wall?.code === 'RateLimited') {
+        reportRateLimitWall(resolvedEmail, routedModel, wall.waitHours);
+        const alternative = await pickAccount(resolvedEmail);
+        if (alternative) {
+          decrementInFlight(alternative.email);
+          logStore.log('warn', 'chat', `[Chat] Mid-payload RateLimited on ${resolvedEmail} (${routedModel}) — rotating account`);
+          streamReader.cancel().catch(() => {});
+          qwenAbortController?.abort();
+          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+          lastFailedEmail = resolvedEmail;
+          lastError = new QwenUpstreamError(wall.message, 'RateLimited', 429);
+          continue;
+        }
+        logStore.log(
+          'warn',
+          'chat',
+          `[Chat] Mid-payload RateLimited on ${resolvedEmail} (${routedModel}) — no alternative account available`,
+        );
+      }
+    }
+
     // Reconstruct stream with the first chunk prepended, then pipe remaining data through.
     // This lets us keep the first chunk (already read) while allowing async consumption.
     stream = new ReadableStream<Uint8Array>({
@@ -446,6 +473,44 @@ export async function chatCompletions(c: Context) {
       );
     }
 
+    if (!isStream) {
+      for (let midBodyAttempt = 0; ; midBodyAttempt++) {
+        const { session, nextParentId, sessionHeaders, resolvedEmail, stream } = await setupSession(
+          messages,
+          body,
+          contextCheck.availableTokens!,
+          toolCalling,
+          logId,
+        );
+        const completionId = 'chatcmpl-' + crypto.randomUUID();
+        try {
+          return await handleNonStreamingRequest({
+            c,
+            logId,
+            completionId,
+            body,
+            session,
+            stream,
+            resolvedEmail,
+            initialParentId: nextParentId,
+            sessionHeaders,
+            toolCalling,
+            cleanOutput,
+          });
+        } catch (err: any) {
+          const retryable =
+            err instanceof QwenUpstreamError && err.upstreamCode === 'RateLimited' && midBodyAttempt < MAX_MID_BODY_RETRIES - 1;
+          logStore.log(
+            'warn',
+            'chat',
+            `[Chat] Mid-body RateLimited — ${retryable ? `rotating account (${midBodyAttempt + 1}/${MAX_MID_BODY_RETRIES})` : 'no rotation possible'}`,
+          );
+          if (retryable) continue;
+          throw err;
+        }
+      }
+    }
+
     const { session, nextParentId, sessionHeaders, resolvedEmail, stream, qwenAbortController } = await setupSession(
       messages,
       body,
@@ -453,24 +518,7 @@ export async function chatCompletions(c: Context) {
       toolCalling,
       logId,
     );
-
     const completionId = 'chatcmpl-' + crypto.randomUUID();
-
-    if (!isStream) {
-      return handleNonStreamingRequest({
-        c,
-        logId,
-        completionId,
-        body,
-        session,
-        stream,
-        resolvedEmail,
-        initialParentId: nextParentId,
-        sessionHeaders,
-        toolCalling,
-        cleanOutput,
-      });
-    }
 
     return await handleStreamingRequest({
       c,

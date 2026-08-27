@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { CircuitBreaker, CircuitOpenError, withRetry } from '../utils/retry.ts';
 import { logCrash, logSessionClose } from '../utils/wreqCrashLogger.ts';
-import { decrementInFlight, getTokenWithAccount, pickAccount, throttleAccount } from './auth.ts';
+import { decrementInFlight, getAccountByEmail, getTokenWithAccount, pickAccount, throttleAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { config } from './configService.ts';
 import { logStore } from './logStore.ts';
@@ -50,6 +50,17 @@ export class QwenUpstreamError extends Error {
     this.upstreamCode = upstreamCode;
     this.upstreamStatus = upstreamStatus;
   }
+}
+
+export function reportRateLimitWall(
+  accountEmail: string | null | undefined,
+  model: string | null | undefined,
+  waitHours: number | null | undefined,
+): void {
+  if (!accountEmail || !getAccountByEmail(accountEmail)) return;
+  const hours = Math.max(1, Math.floor(waitHours || 1));
+  recordRateLimited(accountEmail, model || 'unknown', hours);
+  throttleAccount(accountEmail, hours * 3600_000);
 }
 
 class UpstreamStatusError extends Error {
