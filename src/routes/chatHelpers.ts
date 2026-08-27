@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { modelRouter } from '../services/modelRouter.ts';
-import { buildFeatureConfig, createQwenStream, fetchQwenModels } from '../services/qwen.ts';
+import { buildFeatureConfig, createQwenStream, fetchQwenModels, resolveThinkingMode, type ThinkingMode } from '../services/qwen.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { type FunctionToolDefinition, getNativeToolCallState, toolsToLocalMcp } from '../tools/nativeMcp.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
@@ -66,6 +66,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   // Native MCP mode: when body.tools is present, tool results are sent as
   // separate role:"function" messages instead of XML <tool-result> in the prompt.
   const nativeMcp = !!(body.tools && Array.isArray(body.tools) && body.tools.length > 0);
+  const thinkingMode = resolveThinkingMode(body.thinking_mode, body.enableThinking, nativeMcp, body.model?.includes('-no-thinking'));
   let latestAssistantToolCallIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === 'assistant' && Array.isArray(messages[i].tool_calls) && messages[i].tool_calls.length > 0) {
@@ -199,7 +200,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   // Single user message with all history wrapped in <user>/<assist> tags
   let prompt = segments.length > 0 ? segments.join('\n\n') : '';
 
-  const featureConfig = buildFeatureConfig(true);
+  const featureConfig = buildFeatureConfig(thinkingMode);
 
   if (nativeMcp) {
     featureConfig.local_mcp = toolsToLocalMcp(body.tools as FunctionToolDefinition[]);
@@ -287,7 +288,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       timestamp,
       models: [model],
       chat_type: 't2t',
-      feature_config: buildFeatureConfig(true),
+      feature_config: buildFeatureConfig(thinkingMode),
       extra: { meta: { subChatType: 't2t' } },
       sub_chat_type: 't2t',
       parent_id: continuationState.parentId,
@@ -379,6 +380,7 @@ export async function createQwenStreamWithRetry(
   resolvedEmail: string,
   tools?: unknown[],
   toolChoice?: unknown,
+  thinkingMode?: ThinkingMode,
 ): Promise<{ stream: ReadableStream; abortController: AbortController; qwenLogFile?: string }> {
   try {
     const result = await createQwenStream(
@@ -390,6 +392,7 @@ export async function createQwenStreamWithRetry(
       resolvedEmail,
       tools,
       toolChoice,
+      thinkingMode,
     );
     modelRouter.recordSuccess(routedModel);
     return { stream: result.stream, abortController: result.abortController, qwenLogFile: result.qwenLogFile };

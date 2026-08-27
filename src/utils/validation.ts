@@ -62,6 +62,8 @@ export const openAIRequestSchema = z.object({
       z.object({ type: z.enum(['function']), function: z.object({ name: z.string() }) }),
     ])
     .optional(),
+  thinking_mode: z.enum(['fast', 'auto', 'thinking']).optional(),
+  enableThinking: z.boolean().optional(),
   stream_options: z
     .object({
       include_usage: z.boolean().optional(),

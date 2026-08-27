@@ -84,6 +84,8 @@ export interface OpenAIRequest {
   stream?: boolean;
   tools?: FunctionToolDefinition[];
   tool_choice?: ToolChoice;
+  thinking_mode?: 'fast' | 'auto' | 'thinking';
+  enableThinking?: boolean;
   stream_options?: {
     include_usage?: boolean;
   };

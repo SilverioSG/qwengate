@@ -4,7 +4,13 @@ import { decrementInFlight, pickAccount, throttleAccount } from '../services/aut
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
-import { QwenUpstreamError, RetryableQwenStreamError, reportRateLimitWall } from '../services/qwen.ts';
+import {
+  QwenUpstreamError,
+  RetryableQwenStreamError,
+  reportRateLimitWall,
+  resolveThinkingMode,
+  type ThinkingMode,
+} from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
 import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
@@ -124,6 +130,12 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
     systemContent,
     toolResultsContent,
   } = buildQwenMessages(cleanedMessages, body, availableTokens, toolCalling);
+  const thinkingMode: ThinkingMode = resolveThinkingMode(
+    body.thinking_mode,
+    body.enableThinking,
+    !!body.tools?.length,
+    body.model.includes('-no-thinking'),
+  );
 
   // ── Inline content truncation ─────────────────────────────────
   // Keep the most recent ~50k characters inline; push older history
@@ -167,7 +179,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
   const continuationState = continuationToolCallId ? getNativeToolCallState(continuationToolCallId) : undefined;
   const continuationSession = continuationState ? await sessionPool.acquireContinuation(continuationState.chatId) : undefined;
 
-  const isThinkingModel = !body.model.includes('no-thinking');
+  const isThinkingModel = thinkingMode !== 'fast';
   const MAX_ACCOUNT_RETRIES = 5;
   let lastError: any;
 
@@ -273,6 +285,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         resolvedEmail,
         body.tools,
         body.tool_choice,
+        thinkingMode,
       );
     } catch (err: any) {
       // Release the acquired session to prevent pool exhaustion + inFlight leak
@@ -426,6 +439,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
     return {
       sessionMessages,
       sessionMessageFid: sessionMessages[0]?.childrenIds?.[0] || sessionMessages[0]?.fid,
+      thinkingMode,
       session,
       nextParentId,
       sessionHeaders,

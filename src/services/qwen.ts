@@ -17,13 +17,32 @@ export const QWEN_CHAT_COMPLETIONS_URL = `${QWEN_API_BASE}/api/v2/chat/completio
 export const QWEN_SETTINGS_URL = `${QWEN_API_BASE}/api/v2/users/user/settings/update`;
 
 /** Build shared feature_config for Qwen message payloads. */
-export function buildFeatureConfig(_enableThinking: boolean): Record<string, any> {
+export type ThinkingMode = 'fast' | 'auto' | 'thinking';
+
+export function resolveThinkingMode(
+  requestedMode: unknown,
+  enableThinking: boolean | undefined,
+  hasTools: boolean,
+  legacyNoThinkingModel: boolean = false,
+): ThinkingMode {
+  if (requestedMode === 'fast' || requestedMode === 'auto' || requestedMode === 'thinking') return requestedMode;
+  if (enableThinking !== undefined) return enableThinking ? 'thinking' : 'fast';
+  if (legacyNoThinkingModel) return 'fast';
+  return hasTools ? 'fast' : 'auto';
+}
+
+export function buildFeatureConfig(mode: ThinkingMode | boolean = 'auto'): Record<string, any> {
+  const thinkingMode: ThinkingMode = typeof mode === 'boolean' ? (mode ? 'thinking' : 'fast') : mode;
+  const thinkingConfig = {
+    fast: { thinking_enabled: false, auto_thinking: false, thinking_mode: 'Fast' },
+    auto: { thinking_enabled: true, auto_thinking: true, thinking_mode: 'Auto' },
+    thinking: { thinking_enabled: true, auto_thinking: false, thinking_mode: 'Thinking' },
+  }[thinkingMode];
+
   return {
-    thinking_enabled: true,
+    ...thinkingConfig,
     output_schema: 'phase',
     research_mode: 'normal',
-    auto_thinking: false,
-    thinking_mode: 'Thinking',
     thinking_format: 'summary',
     auto_search: true,
   };
@@ -209,6 +228,7 @@ export async function createQwenStream(
   accountEmail?: string,
   tools?: unknown[],
   toolChoice?: unknown,
+  thinkingMode?: ThinkingMode,
 ): Promise<QwenStreamResult> {
   const actualParentId: string | null = parentId !== undefined ? parentId : null;
   const timestamp = Math.floor(Date.now() / 1000);
@@ -226,7 +246,7 @@ export async function createQwenStream(
     timestamp: msg.timestamp || timestamp,
     models: msg.models || [model],
     chat_type: msg.chat_type || 't2t',
-    feature_config: msg.feature_config || buildFeatureConfig(enableThinking),
+    feature_config: msg.feature_config || buildFeatureConfig(thinkingMode ?? enableThinking),
     extra: msg.extra || { meta: { subChatType: 't2t' } },
     sub_chat_type: msg.sub_chat_type || 't2t',
     parent_id: msg.parent_id ?? (i === 0 ? actualParentId : null),
