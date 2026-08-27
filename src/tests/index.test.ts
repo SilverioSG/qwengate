@@ -311,6 +311,7 @@ test('Chat completions with image uploads attaches files (t2t chat_type, vision 
   let stsCalled = false;
   let ossCalled = false;
   let chatPayload: any = null;
+  let chatSignal: AbortSignal | undefined;
 
   (globalThis as any).fetch = async (input: any, init?: any) => {
     const url = typeof input === 'string' ? input : input.url;
@@ -349,6 +350,7 @@ test('Chat completions with image uploads attaches files (t2t chat_type, vision 
     if (url.includes('/api/v2/chat/completions')) {
       // Capture the payload for later assertions
       // init?.body is set when browserlessFetch calls globalThis.fetch(url, { method, headers, body })
+      chatSignal = init?.signal;
       const bodyStr =
         typeof input === 'string' && init?.body ? init.body : typeof input !== 'string' ? await (input as Request).clone().text() : '';
       try {
@@ -390,6 +392,8 @@ test('Chat completions with image uploads attaches files (t2t chat_type, vision 
 
     const res = await app.fetch(req);
     assert.strictEqual(res.status, 200);
+    assert.ok(chatSignal instanceof AbortSignal, 'Qwen stream should pass an abort signal to browserlessFetch');
+    assert.strictEqual(chatSignal?.aborted, false);
 
     // Verify STS token was requested (image upload initiated)
     assert.ok(stsCalled, 'Should have called getstsToken for image upload');

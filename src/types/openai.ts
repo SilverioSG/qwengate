@@ -93,6 +93,7 @@ export interface ParsedToolCall {
   id: string;
   name: string;
   arguments: unknown;
+  mcpName?: string;
 }
 
 export interface ModelSpec {

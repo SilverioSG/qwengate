@@ -1,6 +1,7 @@
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { reportRateLimitWall } from '../services/qwen.ts';
+import { rememberNativeToolCalls } from '../tools/nativeMcp.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls } from '../tools/xmlToolParser.ts';
 import { type AmplificationGuardState, checkAmplificationGuard, getSnapshotDelta, parseQwenErrorPayload } from './chatHelpers.ts';
 import { filterContentPipeline, processStreamData, type StreamProcessingCtx, type StreamProcessingState } from './chatStreamingHelpers.ts';
@@ -30,6 +31,7 @@ export async function runStreamLoop(
   while (true) {
     if (streamDone) break;
     if (c.req.raw?.signal?.aborted) {
+      streamCtx.qwenAbortController.abort();
       reader.cancel();
       break;
     }
@@ -114,6 +116,9 @@ export async function handlePostStreamCompletion(
     buffer: string;
     enableContentFiltering: boolean;
     includeUsage: boolean;
+    chatId?: string;
+    sessionHeaders?: { cookie: string; userAgent: string };
+    functionFid?: string;
   },
   cleanup: {
     reader: ReadableStreamDefaultReader<Uint8Array>;
@@ -121,7 +126,10 @@ export async function handlePostStreamCompletion(
     chatId: string;
     sessionHeaders: any;
     email: string;
-    sessionPool: { release: (chatId: string, parentId: string | null, headers: any, email: string) => void };
+    sessionPool: {
+      release: (chatId: string, parentId: string | null, headers: any, email: string) => void;
+      holdForContinuation: (chatId: string, parentId: string | null, headers: any, email: string) => void;
+    };
   },
 ): Promise<void> {
   const {
@@ -138,6 +146,17 @@ export async function handlePostStreamCompletion(
     includeUsage,
   } = args;
   const { reader, heartbeatInterval, chatId, sessionHeaders, email, sessionPool } = cleanup;
+  const preserveForContinuation = (streamState.localToolCalls?.length || 0) > 0;
+
+  if (preserveForContinuation && args.chatId && args.sessionHeaders && args.functionFid && streamState.targetResponseId) {
+    rememberNativeToolCalls(streamState.localToolCalls!, {
+      chatId: args.chatId,
+      parentId: streamState.targetResponseId,
+      accountEmail: resolvedEmail,
+      sessionHeaders: args.sessionHeaders,
+      functionFid: args.functionFid,
+    });
+  }
 
   try {
     // ── Flush partial content FIRST ──────────────────────────────────
@@ -237,6 +256,10 @@ export async function handlePostStreamCompletion(
       return;
     }
 
+    if (preserveForContinuation && args.chatId && args.sessionHeaders) {
+      await sessionPool.holdForContinuation(chatId, streamState.nextParentId, args.sessionHeaders, resolvedEmail);
+    }
+
     const usage = buildUsage(streamState.promptTokens, streamState.completionTokens, streamState.reasoningBuffer);
     const finalFinishReason = effectiveToolCallCount > 0 ? 'tool_calls' : 'stop';
 
@@ -284,6 +307,16 @@ export async function handlePostStreamCompletion(
     }
   } finally {
     // Always release session to prevent pool exhaustion, even if writeEvent fails
-    scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool);
+    scheduleCleanup(
+      reader,
+      heartbeatInterval,
+      chatId,
+      streamState.nextParentId,
+      sessionHeaders,
+      email,
+      sessionPool,
+      true,
+      preserveForContinuation,
+    );
   }
 }

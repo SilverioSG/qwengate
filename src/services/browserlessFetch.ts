@@ -132,8 +132,8 @@ const wafCheck = (r: Response): boolean => {
  */
 export async function browserlessFetch(url: string, options: BrowserlessFetchOptions = {}): Promise<Response> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) {
-    const { method = 'GET', headers = {}, body } = options;
-    return globalThis.fetch(url, { method, headers, body });
+    const { method = 'GET', headers = {}, body, signal } = options;
+    return globalThis.fetch(url, { method, headers, body, signal });
   }
 
   const { method = 'GET', headers = {}, body, accountEmail, signal, stream } = options;

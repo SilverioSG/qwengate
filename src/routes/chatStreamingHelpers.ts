@@ -45,26 +45,37 @@ const MAX_BUFFER_CHARS = 200;
  *   "extra": {"local_mcp": {"★": [{"tool_name": "★-bash", "params": {"command": "ls -la /tmp"}}]}}}}]}
  * ```
  *
+ * Also supports any server name (e.g. "OpenAI", "Filesystem"):
+ * ```json
+ * {"extra": {"local_mcp": {"OpenAI": [{"tool_name": "read_file", "params": {"path": "/tmp"}}]}}}
+ * ```
+ *
  * @param sseData - Parsed SSE data chunk
- * @returns Array of ParsedToolCall with UUID call IDs
+ * @returns Array of ParsedToolCall with UUID call IDs and the server name
  */
 export function extractLocalMcpToolCalls(sseData: any): ParsedToolCall[] {
   const localMcp = sseData?.choices?.[0]?.delta?.extra?.local_mcp;
-  if (!localMcp) return [];
-
-  const serverTools = localMcp['★'];
-  if (!Array.isArray(serverTools)) return [];
+  if (!localMcp || typeof localMcp !== 'object') return [];
 
   const toolCalls: ParsedToolCall[] = [];
-  for (const tool of serverTools) {
-    if (tool?.tool_name && tool?.params !== undefined) {
-      const rawName = tool.tool_name;
-      const name = rawName.startsWith('★-') ? rawName.slice(2) : rawName;
-      toolCalls.push({
-        id: `call_${crypto.randomUUID()}`,
-        name,
-        arguments: tool.params,
-      });
+
+  // Iterate over ALL server names (★, OpenAI, Filesystem, etc.)
+  for (const [serverName, tools] of Object.entries(localMcp)) {
+    if (!Array.isArray(tools)) continue;
+
+    for (const tool of tools as any[]) {
+      if (tool?.tool_name && tool?.params !== undefined) {
+        const rawName = tool.tool_name;
+        // Strip server prefix (★- prefix or ServerName- prefix) for display name
+        const prefix = serverName === '★' ? '★-' : `${serverName}-`;
+        const name = rawName.startsWith(prefix) ? rawName.slice(prefix.length) : rawName;
+        toolCalls.push({
+          id: `call_${crypto.randomUUID()}`,
+          name,
+          arguments: tool.params,
+          mcpName: serverName,
+        });
+      }
     }
   }
   return toolCalls;
@@ -105,6 +116,7 @@ export interface StreamProcessingState {
    * of `<` in non-XML text (e.g. "x < 3").
    */
   pendingChunk: string;
+  localToolCalls?: ParsedToolCall[];
 }
 
 export interface StreamProcessingCtx {
@@ -120,6 +132,9 @@ export interface StreamProcessingCtx {
   qwenAbortController: AbortController;
   qwenLogFile?: string;
   sseEventCount?: number;
+  chatId?: string;
+  sessionHeaders?: { cookie: string; userAgent: string };
+  functionFid?: string;
 }
 
 export type ProcessStreamResult = 'continue' | 'break_stream';
@@ -208,10 +223,12 @@ export async function processStreamData(data: any, state: StreamProcessingState,
     return 'break_stream';
   }
   let streamFinished = false;
+  let isLocalToolPhase = false;
   if (deltaStatus === 'finished') {
     const deltaPhase = data.choices[0].delta.phase;
     // Always extract and emit local MCP tool calls before breaking
     if (deltaPhase === 'local_tool') {
+      isLocalToolPhase = true;
       const localToolCalls = extractLocalMcpToolCalls(data);
       const newToolCalls = localToolCalls.filter((tc) => {
         const key = `${tc.name}:${JSON.stringify(tc.arguments)}`;
@@ -221,15 +238,18 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       });
 
       if (newToolCalls.length > 0) {
+        const acceptedToolCalls = newToolCalls;
+        state.localToolCalls ||= [];
+        state.localToolCalls.push(...acceptedToolCalls);
         logStore.updateEntry(logId, (entry) => {
-          for (const tc of newToolCalls) {
+          for (const tc of acceptedToolCalls) {
             entry.parsedToolCalls.push({ name: tc.name, args: JSON.stringify(tc.arguments) });
           }
         });
-        for (let i = 0; i < newToolCalls.length; i++) {
-          await writeToolCallEvent(streamWriter, completionId, model, newToolCalls[i], ctx.emittedToolCallCount + i);
+        for (let i = 0; i < acceptedToolCalls.length; i++) {
+          await writeToolCallEvent(streamWriter, completionId, model, acceptedToolCalls[i], ctx.emittedToolCallCount + i);
         }
-        ctx.emittedToolCallCount += newToolCalls.length;
+        ctx.emittedToolCallCount += acceptedToolCalls.length;
       }
       if (ctx.qwenLogFile && localToolCalls.length > 0) {
         logQwenSSE(ctx.qwenLogFile, ctx.sseEventCount || 0, localToolCalls.length, localToolCalls);
@@ -259,6 +279,13 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   if (data.usage) {
     if (data.usage.output_tokens) state.completionTokens = data.usage.output_tokens;
     if (data.usage.input_tokens) state.promptTokens = data.usage.input_tokens;
+  }
+
+  // Skip content extraction for local_tool phases — tool calls are already
+  // emitted as OpenAI tool_calls above; the content field during this phase
+  // is empty or contains XML remnants that should not leak to the client.
+  if (isLocalToolPhase) {
+    return 'continue';
   }
 
   const deltaResult = extractDeltaContent(data, state.targetResponseId, state.currentThoughtIndex, state.reasoningBuffer);

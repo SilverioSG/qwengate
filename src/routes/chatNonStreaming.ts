@@ -17,6 +17,7 @@ import {
 
 const MAX_TOOL_CALLS_PER_TURN = 8;
 
+import { rememberNativeToolCalls } from '../tools/nativeMcp.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
 import { extractLocalMcpToolCalls } from './chatStreamingHelpers.ts';
 
@@ -32,6 +33,7 @@ export interface NonStreamingContext {
   sessionHeaders: any;
   toolCalling: boolean;
   cleanOutput: boolean;
+  sessionMessageFid?: string;
 }
 
 interface StreamProcessorState {
@@ -52,6 +54,7 @@ interface StreamProcessorState {
   upstreamCode?: string;
   upstreamWaitHours?: number;
   upstreamErrorMessage?: string;
+  localToolCalls?: ParsedToolCall[];
 }
 
 function buildPromptString(messages: Message[]): string {
@@ -221,6 +224,7 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
       // processToolCallsThroughGuard expects that shape. Re-wrapping into
       // {function:{name,arguments}} made the guard see tc.name === undefined
       // and silently drop every local_mcp tool call (issue #44).
+      const previousToolCallCount = state.toolCallsOut.length;
       processToolCallsThroughGuard(localToolCalls, state.toolCallsOut, {
         logId: ctx.logId,
         toolSpamGuard: state.toolSpamGuard,
@@ -228,6 +232,12 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
         maxToolCalls: MAX_TOOL_CALLS_PER_TURN,
         logParsed: true,
       });
+      const acceptedIds = new Set(state.toolCallsOut.slice(previousToolCallCount).map((tc) => tc.id));
+      const acceptedLocalToolCalls = localToolCalls.filter((tc) => acceptedIds.has(tc.id));
+      if (acceptedLocalToolCalls.length > 0) {
+        state.localToolCalls ||= [];
+        state.localToolCalls.push(...acceptedLocalToolCalls);
+      }
     }
   }
 }
@@ -414,9 +424,20 @@ export async function handleNonStreamingRequest(ctx: NonStreamingContext): Promi
       }
     }
 
-    nonStreamReleased = true;
-    sessionPool.release(session.chatId, state.nextParentId, sessionHeaders, resolvedEmail);
     const result = await processContentChunks(state, ctx);
+    if (state.localToolCalls?.length && state.targetResponseId && ctx.sessionMessageFid) {
+      rememberNativeToolCalls(state.localToolCalls, {
+        chatId: session.chatId,
+        parentId: state.targetResponseId,
+        accountEmail: resolvedEmail,
+        sessionHeaders,
+        functionFid: ctx.sessionMessageFid,
+      });
+      await sessionPool.holdForContinuation(session.chatId, state.nextParentId, sessionHeaders, resolvedEmail);
+    } else {
+      await sessionPool.release(session.chatId, state.nextParentId, sessionHeaders, resolvedEmail);
+    }
+    nonStreamReleased = true;
     logFinalized = true;
     return result;
   } finally {

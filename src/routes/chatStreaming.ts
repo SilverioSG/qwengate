@@ -23,6 +23,7 @@ export interface StreamingContext {
   toolCalling: boolean;
   cleanOutput: boolean;
   qwenLogFile?: string;
+  sessionMessageFid?: string;
 }
 
 function buildPromptString(messages: Message[]): string {
@@ -74,6 +75,9 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
         ampState,
         qwenAbortController,
         qwenLogFile: ctx.qwenLogFile,
+        chatId: session.chatId,
+        sessionHeaders,
+        functionFid: ctx.sessionMessageFid,
         emittedToolCallCount: 0,
       };
 
@@ -121,6 +125,9 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           buffer: loopResult.buffer,
           enableContentFiltering,
           includeUsage: !!body.stream_options?.include_usage,
+          chatId: session.chatId,
+          sessionHeaders,
+          functionFid: ctx.sessionMessageFid,
         },
         {
           reader,

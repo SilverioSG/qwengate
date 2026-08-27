@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { modelRouter } from '../services/modelRouter.ts';
 import { buildFeatureConfig, createQwenStream, fetchQwenModels } from '../services/qwen.ts';
 import { sessionPool } from '../services/sessionPool.ts';
+import { type FunctionToolDefinition, getNativeToolCallState, toolsToLocalMcp } from '../tools/nativeMcp.ts';
 import { THINK_TAG_NAMES, TOOL_CALL_KEYWORDS } from '../utils/tagNames.ts';
 import { pendingCorrections } from './chatHelpersCore.ts';
 import { compressToolResult } from './compressToolResult.ts';
@@ -61,6 +62,25 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   const segments: string[] = [];
   const systemParts: string[] = [];
   const toolResultObjects: any[] = [];
+
+  // Native MCP mode: when body.tools is present, tool results are sent as
+  // separate role:"function" messages instead of XML <tool-result> in the prompt.
+  const nativeMcp = !!(body.tools && Array.isArray(body.tools) && body.tools.length > 0);
+  let latestAssistantToolCallIndex = -1;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === 'assistant' && Array.isArray(messages[i].tool_calls) && messages[i].tool_calls.length > 0) {
+      latestAssistantToolCallIndex = i;
+      break;
+    }
+  }
+  const messagesAfterLatestAssistantToolCall = messages.slice(latestAssistantToolCallIndex + 1);
+  const hasConversationMessageAfterToolCall = messagesAfterLatestAssistantToolCall.some(
+    (msg: any) => msg.role !== 'tool' && msg.role !== 'function',
+  );
+  const nativeToolResultMessages = hasConversationMessageAfterToolCall
+    ? []
+    : messagesAfterLatestAssistantToolCall.filter((msg: any) => (msg.role === 'tool' || msg.role === 'function') && !!msg.tool_call_id);
+  const hasNativeToolResults = nativeToolResultMessages.some((msg: any) => !!getNativeToolCallState(msg.tool_call_id));
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -133,6 +153,14 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 
       segments.push(`<assist>\n${assistantContent}\n</assist>`);
     } else if (msg.role === 'tool' || msg.role === 'function') {
+      // ── Native MCP: emit role:"function" messages for tool results ──────
+      // In native_mcp mode, tool results are sent as separate Qwen-native
+      // function messages, NOT as XML <tool-result> in the prompt.
+      if (hasNativeToolResults) {
+        // Skip — these are collected below and emitted as separate messages.
+        continue;
+      }
+
       let toolName = msg.name;
       if (!toolName && msg.tool_call_id) {
         for (let j = i - 1; j >= 0; j--) {
@@ -173,21 +201,10 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
 
   const featureConfig = buildFeatureConfig(true);
 
-  if (body.tools && Array.isArray(body.tools) && body.tools.length > 0) {
-    const localMcp: Record<string, any> = {};
-    localMcp['★'] = {};
-    const toolNames: string[] = [];
-    for (const t of body.tools) {
-      const fn = t.function || {};
-      localMcp['★'][fn.name] = {
-        description: fn.description || '',
-        input_schema: fn.parameters || { type: 'object', properties: {} },
-      };
-      toolNames.push(`${fn.name}${fn.description ? ` (${fn.description})` : ''}`);
-    }
-    featureConfig.local_mcp = localMcp;
-    // ponytail: tool schema in system prompt as textual fallback for models
-    // that don't honor feature_config.local_mcp consistently
+  if (nativeMcp) {
+    featureConfig.local_mcp = toolsToLocalMcp(body.tools as FunctionToolDefinition[]);
+    // Textual fallback in system prompt for models that don't honor
+    // feature_config.local_mcp consistently
     const toolDescriptions = body.tools
       .map((t: any) => {
         const fn = t.function || {};
@@ -200,7 +217,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
     );
   }
 
-  // Single message (Qwen API only accepts 1 message per chat)
+  // Single user message (Qwen API only accepts 1 user message per chat)
   const fid = randomUUID();
   const systemContent = systemParts.length > 0 ? systemParts.join('\n\n') : undefined;
   const formatToolResult = (r: {
@@ -210,6 +227,7 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
   }) =>
     `<tool_result tool="${r.tool}" success="${r.result.success}">\n<command>${escXml(r.result.command || '')}</command>\n<stdout>${escXml(r.result.stdout || '')}</stdout>\n<stderr>${escXml(r.result.stderr || '')}</stderr>\n</tool_result>`;
   const toolResultsContent = toolResultObjects.length > 0 ? toolResultObjects.map(formatToolResult).join('\n\n') : undefined;
+
   const qwenMessages: QwenMessage[] = [
     {
       fid,
@@ -228,6 +246,60 @@ export function buildQwenMessages(messages: any[], body: any, availableTokens: n
       parent_id: null,
     },
   ];
+
+  // ── Native MCP continuation ────────────────────────────────────────
+  // Qwen's native continuation POST contains exactly one role:function
+  // message. Its parent_id is the response_id from the preceding round.
+  if (hasNativeToolResults) {
+    const functionContent: Record<string, Array<Record<string, string>>> = {};
+    let continuationState: ReturnType<typeof getNativeToolCallState>;
+
+    for (const msg of nativeToolResultMessages) {
+      let contentStr = '';
+      if (Array.isArray(msg.content)) {
+        contentStr = msg.content.map((c: any) => c.text || JSON.stringify(c)).join('\n');
+      } else if (typeof msg.content === 'object' && msg.content !== null) {
+        contentStr = JSON.stringify(msg.content);
+      } else {
+        contentStr = msg.content || '';
+      }
+
+      const toolCallId = msg.tool_call_id;
+      const mapped = toolCallId ? getNativeToolCallState(toolCallId) : undefined;
+      if (!mapped) throw new Error(`Native MCP tool_call_id not found: ${toolCallId || '(missing)'}`);
+      continuationState ||= mapped;
+
+      const truncated = compressToolResult(contentStr || '');
+      const server = functionContent[mapped.mcpName] || (functionContent[mapped.mcpName] = []);
+      server.push({ [mapped.toolName]: truncated });
+    }
+
+    if (!continuationState) throw new Error('Native MCP continuation has no tool results');
+
+    const functionMessage: QwenMessage = {
+      fid: continuationState.functionFid,
+      parentId: continuationState.parentId,
+      childrenIds: [],
+      role: 'function',
+      content: functionContent,
+      user_action: 'chat',
+      files: [],
+      timestamp,
+      models: [model],
+      chat_type: 't2t',
+      feature_config: buildFeatureConfig(true),
+      extra: { meta: { subChatType: 't2t' } },
+      sub_chat_type: 't2t',
+      parent_id: continuationState.parentId,
+      model,
+      modelName: body.model,
+      modelIdx: 0,
+      userContext: null,
+      info: {},
+    };
+
+    return { qwenMessages: [functionMessage], systemContent: undefined, toolResultsContent: undefined };
+  }
 
   return { qwenMessages, systemContent, toolResultsContent };
 }
