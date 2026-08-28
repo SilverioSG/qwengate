@@ -358,3 +358,16 @@ Uses Bun's built-in test runner. Covers content filtering, tool-call parsing, st
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+---
+
+## Linux installation
+
+Validated Linux installation procedure for the Native MCP branch:
+
+[docs/INSTALL-LINUX.md](docs/INSTALL-LINUX.md)
+
+Quick start:
+
+```bash
+./scripts/install-linux.sh
