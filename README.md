@@ -371,3 +371,4 @@ Quick start:
 
 ```bash
 ./scripts/install-linux.sh
+```
