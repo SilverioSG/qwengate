@@ -285,7 +285,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   // emitted as OpenAI tool_calls above; the content field during this phase
   // is empty or contains XML remnants that should not leak to the client.
   if (isLocalToolPhase) {
-    return 'continue';
+    return streamFinished ? 'break_stream' : 'continue';
   }
 
   const deltaResult = extractDeltaContent(data, state.targetResponseId, state.currentThoughtIndex, state.reasoningBuffer);

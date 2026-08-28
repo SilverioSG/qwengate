@@ -402,7 +402,7 @@ test('processStreamData: local_tool phase suppresses content emission', async ()
   };
 
   const result = await processStreamData(localToolData, state, ctx);
-  assert.strictEqual(result, 'continue');
+  assert.strictEqual(result, 'break_stream');
 
   // Tool call event should be emitted
   const toolEvents = writtenEvents.filter((e) => e.includes('tool_calls'));

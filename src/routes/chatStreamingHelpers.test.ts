@@ -410,3 +410,88 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
   const contentEvents = writtenEvents.filter((e) => !e.includes('tool_calls') && e.includes('"content"'));
   assert.ok(contentEvents.length > 0, 'content should be emitted after buffer overflow force-release');
 });
+
+test('local_tool finished returns break_stream and emits tool_call without content leak', async () => {
+  const logId = 'test-local-tool-finished-leak';
+  logStore.createEntry(logId, 'qwen3.7-max', true);
+
+  const state: StreamProcessingState = {
+    targetResponseId: null,
+    nextParentId: null,
+    completionTokens: 0,
+    promptTokens: 0,
+    currentThoughtIndex: 0,
+    reasoningBuffer: '',
+    lastFullContent: '',
+    lastRawContent: '',
+    lastFilteredSnapshot: '',
+    lastThinkingSnapshot: '',
+    lastVStrRaw: '',
+    lastFilteredFullContent: '',
+    lastDeltaThinkingFull: '',
+    loggedToolCalls: new Set(),
+    lastParsePosition: 0,
+    toolCallDepth: 0,
+    pendingChunk: '',
+  };
+
+  const writtenEvents: string[] = [];
+  const mockStreamWriter = {
+    write: async (chunk: string) => {
+      writtenEvents.push(chunk);
+    },
+  };
+
+  const ctx: StreamProcessingCtx = {
+    streamWriter: mockStreamWriter,
+    completionId: 'test-completion-local-tool',
+    model: 'qwen3.7-max',
+    emittedToolCallCount: 0,
+    enableContentFiltering: false,
+    cleanOutput: true,
+    logId: logId,
+    resolvedEmail: 'test@example.com',
+    ampState: {
+      rawInputBytes: 0,
+      emittedOutputBytes: 0,
+      triggered: false,
+    },
+    qwenAbortController: new AbortController(),
+  };
+
+  const data = {
+    choices: [
+      {
+        delta: {
+          status: 'finished',
+          phase: 'local_tool',
+          extra: {
+            local_mcp: {
+              OpenAI: [
+                {
+                  tool_name: 'bash',
+                  params: { command: 'pwd' },
+                },
+              ],
+            },
+          },
+        },
+      },
+    ],
+  };
+
+  const result = await processStreamData(data, state, ctx);
+
+  assert.strictEqual(result, 'break_stream', 'local_tool finished must return break_stream to allow cleanup/release');
+
+  const toolCallEvents = writtenEvents.filter((e) => e.includes('tool_calls'));
+  assert.strictEqual(toolCallEvents.length, 1, 'exactly one tool_call event should be emitted');
+
+  const parsed = JSON.parse(toolCallEvents[0].replace(/^data: /, ''));
+  const delta = parsed.choices?.[0]?.delta;
+  assert.ok(delta?.tool_calls, 'delta should contain tool_calls');
+  assert.strictEqual(delta.tool_calls[0].function.name, 'bash');
+
+  const contentEvents = writtenEvents.filter((e) => !e.includes('tool_calls') && e.includes('"content"'));
+  assert.strictEqual(contentEvents.length, 0, 'no content events should leak during local_tool finished');
+});
