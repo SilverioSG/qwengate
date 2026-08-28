@@ -39,10 +39,8 @@ export function scheduleCleanup(
   email: string,
   sessionPool: {
     release: (chatId: string, parentId: string | null, headers: any, email: string, isSuccess?: boolean) => void;
-    holdForContinuation?: (chatId: string, parentId: string | null, headers: any, email: string) => void;
   },
   isSuccess: boolean = true,
-  preserveForContinuation: boolean = false,
 ): () => void {
   let cancelled = false;
   setTimeout(() => {
@@ -58,11 +56,7 @@ export function scheduleCleanup(
     } catch {
       /* ignore */
     }
-    if (preserveForContinuation && sessionPool.holdForContinuation) {
-      sessionPool.holdForContinuation(chatId, parentId, headers, email);
-    } else {
-      sessionPool.release(chatId, parentId, headers, email, isSuccess);
-    }
+    sessionPool.release(chatId, parentId, headers, email, isSuccess);
   }, 0);
   return () => {
     cancelled = true;

@@ -2,13 +2,10 @@ import assert from 'node:assert';
 import test from 'node:test';
 import type { FunctionToolDefinition } from '../types/openai.ts';
 import {
-  buildFunctionResultMessage,
-  buildToolCallMap,
   createLocalToolAccumulator,
   feedLocalToolChunk,
   localToolToOpenAIToolCall,
   OPENAI_MCP_NAMESPACE,
-  rememberNativeToolCalls,
   toolsToLocalMcp,
 } from './nativeMcp.ts';
 
@@ -231,48 +228,6 @@ test('extractLocalMcpToolCalls: handles non-array server tools', async () => {
   assert.deepStrictEqual(extractLocalMcpToolCalls(sseData), []);
 });
 
-// ── buildFunctionResultMessage ────────────────────────────────────
-
-test('buildFunctionResultMessage: builds correct function message', () => {
-  const toolCallMap = new Map([['call_123', { mcpName: 'OpenAI', toolName: 'read_file' }]]);
-
-  const result = buildFunctionResultMessage('call_123', 'file content here', toolCallMap);
-  assert.ok(result);
-  assert.strictEqual(result!.role, 'function');
-  assert.deepStrictEqual(result!.content, {
-    OpenAI: [{ read_file: 'file content here' }],
-  });
-});
-
-test('buildFunctionResultMessage: returns null for unknown call ID', () => {
-  const toolCallMap = new Map([['call_123', { mcpName: 'OpenAI', toolName: 'read_file' }]]);
-  const result = buildFunctionResultMessage('call_999', 'content', toolCallMap);
-  assert.strictEqual(result, null);
-});
-
-test('buildFunctionResultMessage: handles ★ namespace', () => {
-  const toolCallMap = new Map([['call_456', { mcpName: '★', toolName: '★-bash' }]]);
-  const result = buildFunctionResultMessage('call_456', '$ ls\nfile1.txt', toolCallMap);
-  assert.ok(result);
-  assert.deepStrictEqual(result!.content, {
-    '★': [{ '★-bash': '$ ls\nfile1.txt' }],
-  });
-});
-
-// ── buildToolCallMap ──────────────────────────────────────────────
-
-test('buildToolCallMap: builds correct mapping', () => {
-  const toolCalls = [
-    { id: 'call_1', type: 'function' as const, function: { name: 'bash', arguments: '{}' } },
-    { id: 'call_2', type: 'function' as const, function: { name: 'grep', arguments: '{}' } },
-  ];
-
-  const map = buildToolCallMap(toolCalls, 'OpenAI');
-  assert.deepStrictEqual(map.get('call_1'), { mcpName: 'OpenAI', toolName: 'bash' });
-  assert.deepStrictEqual(map.get('call_2'), { mcpName: 'OpenAI', toolName: 'grep' });
-  assert.strictEqual(map.size, 2);
-});
-
 // ── Accumulator-based extraction ──────────────────────────────────
 
 test('accumulator: typing -> finished lifecycle', () => {
@@ -414,9 +369,9 @@ test('processStreamData: local_tool phase suppresses content emission', async ()
   assert.strictEqual(contentEvents.length, 0, 'should not emit content during local_tool');
 });
 
-// ── buildQwenMessages: native MCP function message path ───────────
+// ── buildQwenMessages: upstream replay with Native MCP tools ──────
 
-test('buildQwenMessages: native_mcp mode builds role:function messages for tool results', async () => {
+test('buildQwenMessages: native_mcp mode replays tool results in a root user message', async () => {
   const { buildQwenMessages } = await import('../routes/chatHelpers.ts');
 
   const messages = [
@@ -442,25 +397,14 @@ test('buildQwenMessages: native_mcp mode builds role:function messages for tool 
     ],
   };
 
-  rememberNativeToolCalls([{ id: 'call_abc123', name: 'read_file', arguments: {} }], {
-    chatId: 'chat-test-1',
-    parentId: 'response-test-1',
-    accountEmail: 'test@example.com',
-    sessionHeaders: { cookie: '', userAgent: '' },
-    functionFid: 'function-fid-1',
-  });
-
   const result = buildQwenMessages(messages, body, 100000, true);
 
-  // Native continuation must contain exactly one function message.
   assert.strictEqual(result.qwenMessages.length, 1);
-  const functionMsgs = result.qwenMessages.filter((m) => m.role === 'function');
-  assert.strictEqual(functionMsgs.length, 1, 'should have exactly 1 function message');
-
-  const fnMsg = functionMsgs[0];
-  assert.deepStrictEqual(fnMsg.content, {
-    OpenAI: [{ read_file: 'File contents here' }],
-  });
+  assert.strictEqual(result.qwenMessages[0].role, 'user');
+  assert.strictEqual(result.qwenMessages[0].parent_id, null);
+  assert.match(String(result.qwenMessages[0].content), /<user>\nRead the file \/tmp\/test\.txt\n<\/user>/);
+  assert.match(String(result.qwenMessages[0].content), /<assist>/);
+  assert.match(String(result.qwenMessages[0].content), /<tool-result tool="read_file">\nFile contents here\n<\/tool-result>/);
 });
 
 test('buildQwenMessages: native_mcp mode with multiple tool results', async () => {
@@ -487,28 +431,13 @@ test('buildQwenMessages: native_mcp mode with multiple tool results', async () =
     ],
   };
 
-  rememberNativeToolCalls(
-    [
-      { id: 'call_1', name: 'bash', arguments: {} },
-      { id: 'call_2', name: 'grep', arguments: {} },
-    ],
-    {
-      chatId: 'chat-test-2',
-      parentId: 'response-test-2',
-      accountEmail: 'test@example.com',
-      sessionHeaders: { cookie: '', userAgent: '' },
-      functionFid: 'function-fid-2',
-    },
-  );
-
   const result = buildQwenMessages(messages, body, 100000, true);
 
-  const functionMsgs = result.qwenMessages.filter((m) => m.role === 'function');
-  assert.strictEqual(functionMsgs.length, 1, 'should have 1 grouped function message');
-
-  assert.deepStrictEqual(functionMsgs[0].content, {
-    OpenAI: [{ bash: 'file1.txt\nfile2.txt' }, { grep: 'file1.txt:foo bar' }],
-  });
+  assert.strictEqual(result.qwenMessages[0].role, 'user');
+  assert.strictEqual(result.qwenMessages[0].parent_id, null);
+  const content = String(result.qwenMessages[0].content);
+  assert.match(content, /<tool-result tool="bash">\nfile1\.txt\nfile2\.txt\n<\/tool-result>/);
+  assert.match(content, /<tool-result tool="grep">\nfile1\.txt:foo bar\n<\/tool-result>/);
 });
 
 test('buildQwenMessages: non-native_mcp mode wraps tool results as XML', async () => {
@@ -523,16 +452,15 @@ test('buildQwenMessages: non-native_mcp mode wraps tool results as XML', async (
 
   const result = buildQwenMessages(messages, body, 100000, false);
 
-  // Should have only 1 user message (no separate function messages)
-  const functionMsgs = result.qwenMessages.filter((m) => m.role === 'function');
-  assert.strictEqual(functionMsgs.length, 0, 'should have 0 function messages in non-native mode');
+  assert.strictEqual(result.qwenMessages.length, 1);
+  assert.strictEqual(result.qwenMessages[0].role, 'user');
 
   // Tool result should be in the user message as XML
   const userContent = result.qwenMessages[0].content as string;
   assert.ok(userContent.includes('<tool-result'), 'should contain XML tool-result tag');
 });
 
-test('buildQwenMessages: native_mcp mode resolves tool_call_id from assistant tool_calls', async () => {
+test('buildQwenMessages: replay resolves tool_call_id from assistant tool_calls', async () => {
   const { buildQwenMessages } = await import('../routes/chatHelpers.ts');
 
   const messages = [
@@ -549,22 +477,13 @@ test('buildQwenMessages: native_mcp mode resolves tool_call_id from assistant to
     tools: [{ type: 'function', function: { name: 'bash', description: 'Run bash', parameters: { type: 'object', properties: {} } } }],
   };
 
-  rememberNativeToolCalls([{ id: 'call_xyz', name: 'bash', arguments: {} }], {
-    chatId: 'chat-test-3',
-    parentId: 'response-test-3',
-    accountEmail: 'test@example.com',
-    sessionHeaders: { cookie: '', userAgent: '' },
-    functionFid: 'function-fid-3',
-  });
-
   const result = buildQwenMessages(messages, body, 100000, true);
 
-  const fnMsgs = result.qwenMessages.filter((m) => m.role === 'function');
-  assert.strictEqual(fnMsgs.length, 1);
-  assert.deepStrictEqual(fnMsgs[0].content, { OpenAI: [{ bash: 'file1.txt' }] });
+  assert.strictEqual(result.qwenMessages[0].role, 'user');
+  assert.match(String(result.qwenMessages[0].content), /<tool-result tool="bash">\nfile1\.txt\n<\/tool-result>/);
 });
 
-test('buildQwenMessages: native_mcp continuation uses only the latest tool round', async () => {
+test('buildQwenMessages: native_mcp replays every tool round in a new root message', async () => {
   const { buildQwenMessages } = await import('../routes/chatHelpers.ts');
 
   const messages = [
@@ -581,19 +500,6 @@ test('buildQwenMessages: native_mcp continuation uses only the latest tool round
     { role: 'tool', tool_call_id: 'call_latest_round', content: 'latest result' },
   ];
 
-  const state = {
-    accountEmail: 'test@example.com',
-    chatId: 'chat-test-latest',
-    parentId: 'response-latest',
-    sessionHeaders: { cookie: '', userAgent: '' },
-    functionFid: 'function-fid-latest',
-  };
-  rememberNativeToolCalls([{ id: 'call_old_round', name: 'bash', arguments: {} }], {
-    ...state,
-    parentId: 'response-old',
-  });
-  rememberNativeToolCalls([{ id: 'call_latest_round', name: 'grep', arguments: {} }], state);
-
   const result = buildQwenMessages(
     messages,
     {
@@ -608,22 +514,15 @@ test('buildQwenMessages: native_mcp continuation uses only the latest tool round
   );
 
   assert.strictEqual(result.qwenMessages.length, 1);
-  assert.strictEqual(result.qwenMessages[0].parent_id, 'response-latest');
-  assert.deepStrictEqual(result.qwenMessages[0].content, {
-    OpenAI: [{ grep: 'latest result' }],
-  });
+  assert.strictEqual(result.qwenMessages[0].role, 'user');
+  assert.strictEqual(result.qwenMessages[0].parent_id, null);
+  const content = String(result.qwenMessages[0].content);
+  assert.match(content, /<tool-result tool="bash">\nold result\n<\/tool-result>/);
+  assert.match(content, /<tool-result tool="grep">\nlatest result\n<\/tool-result>/);
 });
 
 test('buildQwenMessages: historical tool results are not a continuation after a new user message', async () => {
   const { buildQwenMessages } = await import('../routes/chatHelpers.ts');
-
-  rememberNativeToolCalls([{ id: 'call_historical', name: 'bash', arguments: {} }], {
-    chatId: 'chat-test-follow-up',
-    parentId: 'response-finished',
-    accountEmail: 'test@example.com',
-    sessionHeaders: { cookie: '', userAgent: '' },
-    functionFid: 'function-fid-follow-up',
-  });
 
   const result = buildQwenMessages(
     [
@@ -642,9 +541,6 @@ test('buildQwenMessages: historical tool results are not a continuation after a 
   );
 
   assert.strictEqual(result.qwenMessages[0].role, 'user');
-  assert.strictEqual(
-    result.qwenMessages.some((message) => message.role === 'function'),
-    false,
-  );
+  assert.strictEqual(result.qwenMessages[0].parent_id, null);
   assert.match(String(result.qwenMessages[0].content), /Now explain the file\./);
 });

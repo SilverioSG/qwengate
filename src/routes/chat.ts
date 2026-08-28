@@ -14,7 +14,6 @@ import {
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
 import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
 import { sessionPool } from '../services/sessionPool.ts';
-import { getNativeToolCallState } from '../tools/nativeMcp.ts';
 import { cleanTextOfXmlArtifacts } from '../tools/xmlToolParser.ts';
 import { OpenAIRequest } from '../types/openai.ts';
 import { checkContextWindow, estimateTokens } from '../utils/tokenEstimator.ts';
@@ -173,18 +172,13 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
   // File upload happens inside retry loop using the same account as the request
   // (accounts can't access files uploaded by other accounts — must share the account)
   let lastFailedEmail: string | undefined;
-  const lastMessage = messages[messages.length - 1];
-  const continuationToolCallId =
-    lastMessage && (lastMessage.role === 'tool' || lastMessage.role === 'function') ? lastMessage.tool_call_id : undefined;
-  const continuationState = continuationToolCallId ? getNativeToolCallState(continuationToolCallId) : undefined;
-  const continuationSession = continuationState ? await sessionPool.acquireContinuation(continuationState.chatId) : undefined;
 
   const isThinkingModel = thinkingMode !== 'fast';
   const MAX_ACCOUNT_RETRIES = 5;
   let lastError: any;
 
   for (let attempt = 0; attempt < MAX_ACCOUNT_RETRIES; attempt++) {
-    const selectedAccount = continuationSession ? { email: continuationSession.accountEmail } : await pickAccount(lastFailedEmail);
+    const selectedAccount = await pickAccount(lastFailedEmail);
     const accountEmail = selectedAccount?.email;
     if (!selectedAccount && attempt > 0) {
       // On retry: if still no accounts, all are throttled — stop retrying
@@ -245,15 +239,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
 
     let sessionResult;
     try {
-      sessionResult = continuationSession
-        ? {
-            session: continuationSession,
-            qwenMessages: processedMessages,
-            nextParentId: continuationState!.parentId,
-            sessionHeaders: continuationSession.cachedHeaders || {},
-            resolvedEmail: continuationSession.accountEmail || accountEmail || '',
-          }
-        : await acquireSessionWithCorrections(accountEmail, processedMessages);
+      sessionResult = await acquireSessionWithCorrections(accountEmail, processedMessages);
     } catch (err) {
       lastFailedEmail = accountEmail;
       lastError = err;
@@ -299,7 +285,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       logStore.addError(logId, `Stream creation failed for ${resolvedEmail}: ${err.message || String(err)}`);
 
       // If rate limited, try next account — Qwen didn't process the request yet
-      if (!continuationSession && (err.upstreamStatus === 429 || /RateLimited|daily usage limit/i.test(err.message || ''))) {
+      if (err.upstreamStatus === 429 || /RateLimited|daily usage limit/i.test(err.message || '')) {
         lastFailedEmail = resolvedEmail;
         lastError = err;
         continue;
@@ -307,10 +293,9 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       // Bot detection / CAPTCHA: Qwen rejected BEFORE processing (safe to retry on another account).
       // Throttle the detected account so pickAccount won't pick it again.
       if (
-        !continuationSession &&
-        ((err.message || '').includes('FAIL_SYS_USER_VALIDATE') ||
-          (err.message || '').includes('CAPTCHA') ||
-          err instanceof RetryableQwenStreamError)
+        (err.message || '').includes('FAIL_SYS_USER_VALIDATE') ||
+        (err.message || '').includes('CAPTCHA') ||
+        err instanceof RetryableQwenStreamError
       ) {
         lastFailedEmail = resolvedEmail;
         lastError = err;
@@ -319,13 +304,12 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       }
       // Timeout / slow response: Qwen didn't respond in time — skip to next account without penalty
       if (
-        !continuationSession &&
-        (err.name === 'AbortError' ||
-          (err.message || '').includes('timed out') ||
-          (err.message || '').includes('timeout') ||
-          (err.message || '').includes('ETIMEDOUT') ||
-          err.upstreamStatus === 408 ||
-          err.upstreamStatus === 504)
+        err.name === 'AbortError' ||
+        (err.message || '').includes('timed out') ||
+        (err.message || '').includes('timeout') ||
+        (err.message || '').includes('ETIMEDOUT') ||
+        err.upstreamStatus === 408 ||
+        err.upstreamStatus === 504
       ) {
         lastFailedEmail = resolvedEmail;
         lastError = err;
@@ -438,7 +422,6 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
 
     return {
       sessionMessages,
-      sessionMessageFid: sessionMessages[0]?.childrenIds?.[0] || sessionMessages[0]?.fid,
       thinkingMode,
       session,
       nextParentId,
@@ -506,7 +489,7 @@ export async function chatCompletions(c: Context) {
 
     if (!isStream) {
       for (let midBodyAttempt = 0; ; midBodyAttempt++) {
-        const { session, sessionMessageFid, nextParentId, sessionHeaders, resolvedEmail, stream } = await setupSession(
+        const { session, nextParentId, sessionHeaders, resolvedEmail, stream } = await setupSession(
           messages,
           body,
           contextCheck.availableTokens!,
@@ -527,7 +510,6 @@ export async function chatCompletions(c: Context) {
             sessionHeaders,
             toolCalling,
             cleanOutput,
-            sessionMessageFid,
           });
         } catch (err: any) {
           const retryable =
@@ -543,7 +525,7 @@ export async function chatCompletions(c: Context) {
       }
     }
 
-    const { session, sessionMessageFid, nextParentId, sessionHeaders, resolvedEmail, stream, qwenAbortController } = await setupSession(
+    const { session, nextParentId, sessionHeaders, resolvedEmail, stream, qwenAbortController } = await setupSession(
       messages,
       body,
       contextCheck.availableTokens!,
@@ -565,7 +547,6 @@ export async function chatCompletions(c: Context) {
       sessionHeaders,
       toolCalling,
       cleanOutput,
-      sessionMessageFid,
     });
   } catch (err: any) {
     console.error(`[Chat] <<< Request failed after ${Date.now() - _requestStartTime}ms: ${err?.message || err}`);

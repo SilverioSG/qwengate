@@ -2,7 +2,6 @@ import {
   decrementInFlight,
   getAccountByEmail,
   getAllAccountEmails,
-  incrementInFlight,
   incrementTotalRequests,
   pickAccount,
   throttleAccount,
@@ -32,7 +31,6 @@ export class SessionPool {
   private activeSessions = new Set<string>();
   private activeCount = 0;
   private releaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  private continuationSessions = new Map<string, PoolEntry>();
 
   async initialize(): Promise<void> {
     if (process.env.TEST_MOCK_PLAYWRIGHT) {
@@ -99,45 +97,6 @@ export class SessionPool {
     }
 
     throw lastErr instanceof Error ? lastErr : new Error('Failed to acquire session');
-  }
-
-  async acquireContinuation(chatId: string): Promise<PoolEntry> {
-    const entry = this.continuationSessions.get(chatId);
-    if (!entry) throw new Error(`Native MCP continuation session not found: ${chatId}`);
-
-    this.continuationSessions.delete(chatId);
-    entry.inUse = true;
-    this.activeSessions.add(chatId);
-    this.activeCount++;
-    if (entry.accountEmail) incrementInFlight(entry.accountEmail);
-    return entry;
-  }
-
-  async holdForContinuation(
-    chatId: string,
-    newParentId: string | null,
-    cachedHeaders?: { cookie: string; userAgent: string },
-    accountEmail?: string,
-  ): Promise<void> {
-    if (!this.activeSessions.has(chatId)) return;
-
-    if (accountEmail) {
-      decrementInFlight(accountEmail);
-      incrementTotalRequests(accountEmail);
-    }
-    this.activeSessions.delete(chatId);
-    if (this.activeCount > 0) this.activeCount--;
-
-    const existingTimer = this.releaseTimers.get(chatId);
-    if (existingTimer) clearTimeout(existingTimer);
-    this.releaseTimers.delete(chatId);
-    this.continuationSessions.set(chatId, {
-      chatId,
-      parentId: newParentId,
-      inUse: false,
-      cachedHeaders,
-      accountEmail,
-    });
   }
 
   async release(

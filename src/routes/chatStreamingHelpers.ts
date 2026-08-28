@@ -116,7 +116,6 @@ export interface StreamProcessingState {
    * of `<` in non-XML text (e.g. "x < 3").
    */
   pendingChunk: string;
-  localToolCalls?: ParsedToolCall[];
 }
 
 export interface StreamProcessingCtx {
@@ -132,9 +131,6 @@ export interface StreamProcessingCtx {
   qwenAbortController: AbortController;
   qwenLogFile?: string;
   sseEventCount?: number;
-  chatId?: string;
-  sessionHeaders?: { cookie: string; userAgent: string };
-  functionFid?: string;
 }
 
 export type ProcessStreamResult = 'continue' | 'break_stream';
@@ -239,8 +235,6 @@ export async function processStreamData(data: any, state: StreamProcessingState,
 
       if (newToolCalls.length > 0) {
         const acceptedToolCalls = newToolCalls;
-        state.localToolCalls ||= [];
-        state.localToolCalls.push(...acceptedToolCalls);
         logStore.updateEntry(logId, (entry) => {
           for (const tc of acceptedToolCalls) {
             entry.parsedToolCalls.push({ name: tc.name, args: JSON.stringify(tc.arguments) });
