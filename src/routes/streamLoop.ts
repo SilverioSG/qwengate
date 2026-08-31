@@ -226,10 +226,17 @@ export async function handlePostStreamCompletion(
       try {
         require('fs').writeFileSync('/tmp/qwen-error-buffer.json', buffer.slice(0, 10000));
       } catch {}
-      const cleanErrorMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
-      // Append the error as a final content chunk — the partial answer
-      // stays visible, and the user sees why the stream stopped.
-      await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({ content: `\n\n[Error] ${cleanErrorMessage}` })]));
+      if (streamState.hasEmittedContent) {
+        // Post-content error: client already received partial content/reasoning/tool_call.
+        // Don't append [Error] text — the partial answer stays visible and the
+        // stream finishes cleanly with stop. Log the error server-side only.
+        logStore.log('warn', 'chat', `[Chat] Post-content upstream error on ${resolvedEmail}: ${upstreamError.message} — finishing stream`);
+      } else {
+        // Pre-content error: no content was emitted yet.
+        // Write the error as a content chunk so the client knows what happened.
+        const cleanErrorMessage = cleanTextOfXmlArtifacts(upstreamError.message).cleanedText || upstreamError.message;
+        await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({ content: `\n\n[Error] ${cleanErrorMessage}` })]));
+      }
       await writeEvent(streamWriter, buildChunkEvent(completionId, model, [makeChoice({}, 'stop')]));
       await streamWriter.write('data: [DONE]\n\n');
       logStore.updateEntry(logId, (entry) => {

@@ -193,5 +193,6 @@ function buildInitialStreamState(finalPrompt: string, initialParentId: string | 
     lastParsePosition: 0,
     toolCallDepth: 0,
     pendingChunk: '',
+    hasEmittedContent: false,
   };
 }

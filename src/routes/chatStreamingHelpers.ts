@@ -116,6 +116,13 @@ export interface StreamProcessingState {
    * of `<` in non-XML text (e.g. "x < 3").
    */
   pendingChunk: string;
+  /**
+   * Set to true when at least one content delta, reasoning event, or tool call has been
+   * written to the SSE stream. Used by handlePostStreamCompletion to decide post-content
+   * error handling: if content was already emitted, the error is recoverable (no [Error]
+   * text appended to content) vs pre-content (error text is written).
+   */
+  hasEmittedContent: boolean;
 }
 
 export interface StreamProcessingCtx {
@@ -244,6 +251,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
           await writeToolCallEvent(streamWriter, completionId, model, acceptedToolCalls[i], ctx.emittedToolCallCount + i);
         }
         ctx.emittedToolCallCount += acceptedToolCalls.length;
+        state.hasEmittedContent = true;
       }
       if (ctx.qwenLogFile && localToolCalls.length > 0) {
         logQwenSSE(ctx.qwenLogFile, ctx.sseEventCount || 0, localToolCalls.length, localToolCalls);
@@ -298,6 +306,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       const cleaned = cleanTextOfXmlArtifacts(vStr).cleanedText;
       if (cleaned) {
         await writeReasoningEvent(streamWriter, completionId, model, cleaned);
+        state.hasEmittedContent = true;
       }
     }
     return 'continue';
@@ -390,6 +399,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
       await writeToolCallEvent(streamWriter, completionId, model, parsed, ctx.emittedToolCallCount + i);
     }
     ctx.emittedToolCallCount += newToolCalls.length;
+    state.hasEmittedContent = true;
   }
 
   // Truncate lastFullContent to prevent unbounded growth (M-10)
@@ -451,7 +461,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
     const contentDelta = getSnapshotDelta(cleanedText, state.lastFilteredSnapshot);
     state.lastFilteredSnapshot = cleanedText;
     if (contentDelta) {
-      await writeContentDelta(
+      const wrote = await writeContentDelta(
         streamWriter,
         completionId,
         model,
@@ -463,6 +473,7 @@ export async function processStreamData(data: any, state: StreamProcessingState,
         state.lastVStrRaw,
         logStore,
       );
+      if (wrote) state.hasEmittedContent = true;
     }
   }
 

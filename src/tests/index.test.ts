@@ -796,3 +796,330 @@ test('Anthropic /v1/messages streaming with local_mcp tool call emits correct to
     globalThis.fetch = originalFetch;
   }
 });
+
+test('SSE pre-content quota_limit: max 1 handoff then error', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  // Seed two test accounts
+  accounts.push({
+    email: 'acct1@test.dev',
+    password: 'test',
+    state: { token: 'mock-token-1', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0, throttledUntil: 0, refreshInFlight: null, loginAttempt: 0, inFlight: 0, totalRequests: 0, startupStatus: 'ready',
+  });
+  accounts.push({
+    email: 'acct2@test.dev',
+    password: 'test',
+    state: { token: 'mock-token-2', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0, throttledUntil: 0, refreshInFlight: null, loginAttempt: 0, inFlight: 0, totalRequests: 0, startupStatus: 'ready',
+  });
+
+  let chatCalls = 0;
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      chatCalls++;
+      // Both accounts return RateLimited on first chunk
+      return new Response(
+        JSON.stringify({ success: false, data: { code: 'RateLimited', details: 'Daily limit reached', num: 7 } }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify({
+        model: 'qwen3.6-plus',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    // After MAX_ACCOUNT_RETRIES=2 exhausted, should return 429
+    assert.strictEqual(res.status, 429);
+    const body = await res.json();
+    assert.match(body.error.message, /daily usage limit/i);
+
+    // Should have tried at most 2 accounts (1 initial + 1 handoff)
+    assert.ok(chatCalls <= 2, `Expected at most 2 chat calls, got ${chatCalls}`);
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('SSE pre-content internal_error: max 1 handoff then error', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push({
+    email: 'acct1@test.dev',
+    password: 'test',
+    state: { token: 'mock-token-1', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0, throttledUntil: 0, refreshInFlight: null, loginAttempt: 0, inFlight: 0, totalRequests: 0, startupStatus: 'ready',
+  });
+  accounts.push({
+    email: 'acct2@test.dev',
+    password: 'test',
+    state: { token: 'mock-token-2', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0, throttledUntil: 0, refreshInFlight: null, loginAttempt: 0, inFlight: 0, totalRequests: 0, startupStatus: 'ready',
+  });
+
+  let chatCalls = 0;
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      chatCalls++;
+      // Both accounts return internal_error on first chunk
+      return new Response(
+        JSON.stringify({ success: false, data: { code: 'UpstreamError', details: 'Internal server error' } }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify({
+        model: 'qwen3.6-plus',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 502);
+    const body = await res.json();
+    assert.match(body.error.message, /UpstreamError/i);
+
+    // Should have tried at most 2 accounts
+    assert.ok(chatCalls <= 2, `Expected at most 2 chat calls, got ${chatCalls}`);
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('SSE post-content error: partial content preserved, no [Error] text', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push({
+    email: 'acct1@test.dev',
+    password: 'test',
+    state: { token: 'mock-token-1', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0, throttledUntil: 0, refreshInFlight: null, loginAttempt: 0, inFlight: 0, totalRequests: 0, startupStatus: 'ready',
+  });
+
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      // Stream starts with content, then sends error
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":"Hello world"}}]}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: {"success":false,"data":{"code":"RateLimited","details":"quota exceeded","num":3}}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify({
+        model: 'qwen3.6-plus',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers.get('Content-Type'), 'text/event-stream');
+
+    const reader = res.body?.getReader();
+    assert.ok(reader, 'Response should have a readable body');
+
+    const decoder = new TextDecoder();
+    let allSse = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      allSse += decoder.decode(value, { stream: true });
+    }
+
+    // Should contain the partial content
+    assert.ok(allSse.includes('Hello world'), 'Should contain partial content "Hello world"');
+
+    // Should NOT contain [Error] text (post-content error is recoverable)
+    assert.ok(!allSse.includes('[Error]'), 'Should NOT contain [Error] text after content was emitted');
+
+    // Should finish with stop
+    assert.ok(allSse.includes('"finish_reason":"stop"'), 'Should finish with stop reason');
+
+    // Should end with [DONE]
+    assert.ok(allSse.includes('[DONE]'), 'Should end with [DONE]');
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('SSE pre-content error: error text written when no content emitted', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push({
+    email: 'acct1@test.dev',
+    password: 'test',
+    state: { token: 'mock-token-1', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0, throttledUntil: 0, refreshInFlight: null, loginAttempt: 0, inFlight: 0, totalRequests: 0, startupStatus: 'ready',
+  });
+
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      // Stream starts with empty content (passes first-chunk check),
+      // then error arrives BEFORE any real content is emitted
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":""}}]}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: {"success":false,"data":{"code":"RateLimited","details":"quota exceeded","num":3}}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify({
+        model: 'qwen3.6-plus',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const reader = res.body?.getReader();
+    assert.ok(reader, 'Response should have a readable body');
+
+    const decoder = new TextDecoder();
+    let allSse = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      allSse += decoder.decode(value, { stream: true });
+    }
+
+    // Should contain [Error] text (pre-content error surfaces to client)
+    assert.ok(allSse.includes('[Error]'), 'Should contain [Error] text when no content was emitted');
+
+    // Should finish with stop
+    assert.ok(allSse.includes('"finish_reason":"stop"'), 'Should finish with stop reason');
+
+    // Should end with [DONE]
+    assert.ok(allSse.includes('[DONE]'), 'Should end with [DONE]');
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('inFlight cleanup after SSE stream error', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push({
+    email: 'inflight-test@test.dev',
+    password: 'test',
+    state: { token: 'mock-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0, throttledUntil: 0, refreshInFlight: null, loginAttempt: 0, inFlight: 0, totalRequests: 0, startupStatus: 'ready',
+  });
+
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":"Partial"}}]}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: {"success":false,"data":{"code":"RateLimited","details":"limit","num":1}}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify({
+        model: 'qwen3.6-plus',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    // Consume the stream to trigger cleanup
+    const reader = res.body?.getReader();
+    while (true) {
+      const { done } = await reader!.read();
+      if (done) break;
+    }
+
+    // Wait for scheduleCleanup's setTimeout(0) to fire
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Verify session pool was cleaned up (no active sessions)
+    const { sessionPool } = await import('../services/sessionPool.ts');
+    const stats = sessionPool.getStats();
+    assert.strictEqual(stats.total, 0, 'Session pool should have 0 active sessions after cleanup');
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});

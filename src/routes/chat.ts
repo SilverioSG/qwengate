@@ -174,7 +174,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
   let lastFailedEmail: string | undefined;
 
   const isThinkingModel = thinkingMode !== 'fast';
-  const MAX_ACCOUNT_RETRIES = 5;
+  const MAX_ACCOUNT_RETRIES = 2;
   let lastError: any;
 
   for (let attempt = 0; attempt < MAX_ACCOUNT_RETRIES; attempt++) {
@@ -376,6 +376,15 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
           'chat',
           `[Chat] Mid-payload RateLimited on ${resolvedEmail} (${routedModel}) — no alternative account available`,
         );
+      } else if (wall) {
+        // Other upstream errors (internal_error, etc.) in first chunk — rotate pre-content
+        logStore.log('warn', 'chat', `[Chat] First-chunk upstream error on ${resolvedEmail}: ${wall.code} — rotating account`);
+        streamReader.cancel().catch(() => {});
+        qwenAbortController?.abort();
+        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+        lastFailedEmail = resolvedEmail;
+        lastError = new QwenUpstreamError(wall.message, wall.code || 'UpstreamError', wall.status || 502);
+        continue;
       }
     }
 
