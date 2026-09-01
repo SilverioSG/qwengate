@@ -31,7 +31,7 @@ test('Models endpoint returns cleaned OpenAI-compatible model data', async () =>
         JSON.stringify({
           data: [
             {
-              id: 'qwen3.6-plus',
+              id: 'qwen3.8-max',
               owned_by: 'qwen',
               info: {
                 created_at: 1732711466,
@@ -61,20 +61,25 @@ test('Models endpoint returns cleaned OpenAI-compatible model data', async () =>
     const body = await res.json();
     assert.strictEqual(body.object, 'list');
     assert.ok(Array.isArray(body.data));
+    assert.ok(body.data.length >= 3, 'Should return at least the 3 aliases');
 
-    const model = body.data[0];
-    assert.strictEqual(model.id, 'qwen3.6-plus');
-    assert.strictEqual(model.object, 'model');
-    assert.strictEqual(model.created, 1732711466);
-    assert.strictEqual(model.owned_by, 'qwen');
-    assert.strictEqual(model.context_window, 1000000);
-    assert.strictEqual(model.max_output_tokens, 65536);
-    assert.deepStrictEqual(model.modalities, ['text', 'image']);
-    assert.strictEqual(model.description, 'A test model');
-    assert.deepStrictEqual(model.capabilities, { vision: true, thinking: true });
+    // Endpoint now returns only aliases, not upstream models
+    const ids = body.data.map((m: any) => m.id);
+    assert.ok(ids.includes('qwen3.8-max-fast'), 'Should include fast alias');
+    assert.ok(ids.includes('qwen3.8-max-auto'), 'Should include auto alias');
+    assert.ok(ids.includes('qwen3.8-max-thinking'), 'Should include thinking alias');
+
+    // Verify alias metadata inherits from base model
+    const fastAlias = body.data.find((m: any) => m.id === 'qwen3.8-max-fast');
+    assert.strictEqual(fastAlias.object, 'model');
+    assert.strictEqual(fastAlias.context_window, 1000000);
+    assert.strictEqual(fastAlias.max_output_tokens, 65536);
+    assert.deepStrictEqual(fastAlias.modalities, ['text', 'image']);
+    assert.strictEqual(fastAlias.root, 'qwen3.8-max');
+    assert.strictEqual(fastAlias.parent, 'qwen3.8-max');
     // should not carry raw Qwen-internal fields
-    assert.strictEqual(model.info, undefined);
-    assert.strictEqual(model.preset, undefined);
+    assert.strictEqual(fastAlias.info, undefined);
+    assert.strictEqual(fastAlias.preset, undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -1120,6 +1125,299 @@ test('inFlight cleanup after SSE stream error', async () => {
     assert.strictEqual(stats.total, 0, 'Session pool should have 0 active sessions after cleanup');
   } finally {
     accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Model alias: qwen3.8-max-auto resolves to upstream qwen3.8-max with thinking_mode=auto', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push({
+    email: 'alias-test@qwen-gate.dev',
+    password: 'test',
+    state: { token: 'mock-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0, throttledUntil: 0, refreshInFlight: null, loginAttempt: 0, inFlight: 0, totalRequests: 0, startupStatus: 'ready',
+  });
+
+  let chatPayload: any = null;
+  (globalThis as any).fetch = async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/getstsToken')) {
+      return new Response(JSON.stringify({ data: { access_key_id: 'test-key', access_key_secret: 'test-secret', security_token: 'test-token', bucketname: 'test-bucket', region: 'oss-cn-hangzhou', endpoint: 'oss-cn-hangzhou.aliyuncs.com', file_id: 'test-file-id', file_path: 'test-user/test-file-id_context.txt', file_url: 'https://test-bucket.oss-cn-hangzhou.aliyuncs.com/test-file-id_context.txt' } }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse/status')) {
+      return new Response(JSON.stringify({ data: [{ status: 'success' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse')) {
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }
+    if (url.includes('aliyuncs.com') || url.includes('oss-')) {
+      return new Response(null, { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      const bodyStr = typeof input === 'string' && init?.body ? init.body : typeof input !== 'string' ? await (input as Request).clone().text() : '';
+      try { chatPayload = JSON.parse(bodyStr); } catch {}
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":"Tool result processed"}}]}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, { Authorization: 'Bearer test-key-for-testing' }),
+      body: JSON.stringify({
+        model: 'qwen3.8-max-auto',
+        messages: [{ role: 'user', content: 'List files in /tmp' }],
+        tools: [{ type: 'function', function: { name: 'bash', description: 'Run shell', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }],
+        stream: false,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
+
+    assert.ok(chatPayload, 'Upstream chat payload should have been captured');
+
+    // Upstream model must be qwen3.8-max (not qwen3.8-max-auto)
+    const upstreamModel = chatPayload.messages?.[0]?.models?.[0] || chatPayload.model;
+    assert.strictEqual(upstreamModel, 'qwen3.8-max', 'Upstream model must be qwen3.8-max');
+
+    // feature_config.thinking_mode must be Auto (not Fast)
+    const featureConfig = chatPayload.messages?.[0]?.feature_config;
+    assert.ok(featureConfig, 'feature_config should exist');
+    assert.strictEqual(featureConfig.thinking_mode, 'Auto', 'thinking_mode must be Auto');
+    assert.strictEqual(featureConfig.thinking_enabled, true, 'thinking_enabled must be true');
+    assert.strictEqual(featureConfig.auto_thinking, true, 'auto_thinking must be true');
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Model alias: qwen3.8-max-fast resolves to upstream qwen3.8-max with thinking_mode=Fast', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push({
+    email: 'alias-fast-test@qwen-gate.dev',
+    password: 'test',
+    state: { token: 'mock-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0, throttledUntil: 0, refreshInFlight: null, loginAttempt: 0, inFlight: 0, totalRequests: 0, startupStatus: 'ready',
+  });
+
+  let chatPayload: any = null;
+  (globalThis as any).fetch = async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/getstsToken')) {
+      return new Response(JSON.stringify({ data: { access_key_id: 'test-key', access_key_secret: 'test-secret', security_token: 'test-token', bucketname: 'test-bucket', region: 'oss-cn-hangzhou', endpoint: 'oss-cn-hangzhou.aliyuncs.com', file_id: 'test-file-id', file_path: 'test-user/test-file-id_context.txt', file_url: 'https://test-bucket.oss-cn-hangzhou.aliyuncs.com/test-file-id_context.txt' } }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse/status')) {
+      return new Response(JSON.stringify({ data: [{ status: 'success' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse')) {
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }
+    if (url.includes('aliyuncs.com') || url.includes('oss-')) {
+      return new Response(null, { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      const bodyStr = typeof input === 'string' && init?.body ? init.body : typeof input !== 'string' ? await (input as Request).clone().text() : '';
+      try { chatPayload = JSON.parse(bodyStr); } catch {}
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":"Fast mode response"}}]}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, { Authorization: 'Bearer test-key-for-testing' }),
+      body: JSON.stringify({
+        model: 'qwen3.8-max-fast',
+        messages: [{ role: 'user', content: 'List files in /tmp' }],
+        tools: [{ type: 'function', function: { name: 'bash', description: 'Run shell', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }],
+        stream: false,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
+
+    assert.ok(chatPayload, 'Upstream chat payload should have been captured');
+
+    const upstreamModel = chatPayload.messages?.[0]?.models?.[0] || chatPayload.model;
+    assert.strictEqual(upstreamModel, 'qwen3.8-max', 'Upstream model must be qwen3.8-max');
+
+    const featureConfig = chatPayload.messages?.[0]?.feature_config;
+    assert.ok(featureConfig, 'feature_config should exist');
+    assert.strictEqual(featureConfig.thinking_mode, 'Fast', 'thinking_mode must be Fast');
+    assert.strictEqual(featureConfig.thinking_enabled, false, 'thinking_enabled must be false');
+    assert.strictEqual(featureConfig.auto_thinking, false, 'auto_thinking must be false');
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Model alias: qwen3.8-max-thinking resolves to upstream qwen3.8-max with thinking_mode=Thinking', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push({
+    email: 'alias-thinking-test@qwen-gate.dev',
+    password: 'test',
+    state: { token: 'mock-token', expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0, throttledUntil: 0, refreshInFlight: null, loginAttempt: 0, inFlight: 0, totalRequests: 0, startupStatus: 'ready',
+  });
+
+  let chatPayload: any = null;
+  (globalThis as any).fetch = async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.8-max', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/getstsToken')) {
+      return new Response(JSON.stringify({ data: { access_key_id: 'test-key', access_key_secret: 'test-secret', security_token: 'test-token', bucketname: 'test-bucket', region: 'oss-cn-hangzhou', endpoint: 'oss-cn-hangzhou.aliyuncs.com', file_id: 'test-file-id', file_path: 'test-user/test-file-id_context.txt', file_url: 'https://test-bucket.oss-cn-hangzhou.aliyuncs.com/test-file-id_context.txt' } }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse/status')) {
+      return new Response(JSON.stringify({ data: [{ status: 'success' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/files/parse')) {
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }
+    if (url.includes('aliyuncs.com') || url.includes('oss-')) {
+      return new Response(null, { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      const bodyStr = typeof input === 'string' && init?.body ? init.body : typeof input !== 'string' ? await (input as Request).clone().text() : '';
+      try { chatPayload = JSON.parse(bodyStr); } catch {}
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"thinking_summary","extra":{"summary_thought":{"content":["Deep thinking..."]}}}}]}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":"Thinking mode response"}}]}\n\n'));
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, { Authorization: 'Bearer test-key-for-testing' }),
+      body: JSON.stringify({
+        model: 'qwen3.8-max-thinking',
+        messages: [{ role: 'user', content: 'List files in /tmp' }],
+        tools: [{ type: 'function', function: { name: 'bash', description: 'Run shell', parameters: { type: 'object', properties: { command: { type: 'string' } } } } }],
+        stream: false,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
+
+    assert.ok(chatPayload, 'Upstream chat payload should have been captured');
+
+    const upstreamModel = chatPayload.messages?.[0]?.models?.[0] || chatPayload.model;
+    assert.strictEqual(upstreamModel, 'qwen3.8-max', 'Upstream model must be qwen3.8-max');
+
+    const featureConfig = chatPayload.messages?.[0]?.feature_config;
+    assert.ok(featureConfig, 'feature_config should exist');
+    assert.strictEqual(featureConfig.thinking_mode, 'Thinking', 'thinking_mode must be Thinking');
+    assert.strictEqual(featureConfig.thinking_enabled, true, 'thinking_enabled must be true');
+    assert.strictEqual(featureConfig.auto_thinking, false, 'auto_thinking must be false');
+  } finally {
+    accounts.splice(0, accounts.length, ...originalAccounts);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('Model alias: /v1/models returns aliases inheriting base model metadata', async () => {
+  const originalFetch = globalThis.fetch;
+
+  // Mock with upstream data that includes qwen3.8-max (needed for alias injection)
+  (globalThis as any).fetch = async (input: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(
+        JSON.stringify({
+          data: [{
+            id: 'qwen3.8-max',
+            owned_by: 'qwen',
+            info: { created_at: 1732711466, meta: { max_context_length: 1000000, max_summary_generation_length: 65536, modality: ['text'], capabilities: {} } },
+          }],
+        }),
+        { status: 200 },
+      );
+    }
+    return originalFetch(input);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/models', { headers: { Authorization: 'Bearer test-key-for-testing' } });
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const body = await res.json();
+    const ids = body.data.map((m: any) => m.id);
+
+    // Endpoint returns only aliases (not upstream models)
+    assert.ok(ids.includes('qwen3.8-max-fast'), 'Should include alias qwen3.8-max-fast');
+    assert.ok(ids.includes('qwen3.8-max-auto'), 'Should include alias qwen3.8-max-auto');
+    assert.ok(ids.includes('qwen3.8-max-thinking'), 'Should include alias qwen3.8-max-thinking');
+    assert.ok(!ids.includes('qwen3.8-max'), 'Should NOT include upstream base model');
+
+    const fastAlias = body.data.find((m: any) => m.id === 'qwen3.8-max-fast');
+    assert.ok(fastAlias, 'Fast alias entry should exist');
+    assert.strictEqual(fastAlias.root, 'qwen3.8-max', 'Fast alias root should point to base model');
+    assert.strictEqual(fastAlias.parent, 'qwen3.8-max', 'Fast alias parent should point to base model');
+    assert.ok(fastAlias.description.includes('qwen3.8-max'), 'Fast alias description should reference base model');
+    assert.ok(fastAlias.description.includes('thinking_mode=fast'), 'Fast alias description should mention thinking mode');
+
+    const alias = body.data.find((m: any) => m.id === 'qwen3.8-max-auto');
+    assert.ok(alias, 'Auto alias entry should exist');
+    assert.strictEqual(alias.root, 'qwen3.8-max', 'Auto alias root should point to base model');
+    assert.strictEqual(alias.parent, 'qwen3.8-max', 'Auto alias parent should point to base model');
+    assert.ok(alias.description.includes('qwen3.8-max'), 'Auto alias description should reference base model');
+    assert.ok(alias.description.includes('thinking_mode=auto'), 'Auto alias description should mention thinking mode');
+
+    const thinkingAlias = body.data.find((m: any) => m.id === 'qwen3.8-max-thinking');
+    assert.ok(thinkingAlias, 'Thinking alias entry should exist');
+    assert.strictEqual(thinkingAlias.root, 'qwen3.8-max', 'Thinking alias root should point to base model');
+    assert.strictEqual(thinkingAlias.parent, 'qwen3.8-max', 'Thinking alias parent should point to base model');
+    assert.ok(thinkingAlias.description.includes('qwen3.8-max'), 'Thinking alias description should reference base model');
+    assert.ok(thinkingAlias.description.includes('thinking_mode=thinking'), 'Thinking alias description should mention thinking mode');
+
+    // Verify endpoint returns valid OpenAI-compatible structure
+    assert.strictEqual(body.object, 'list');
+    assert.ok(Array.isArray(body.data));
+    assert.ok(body.data.length >= 3, 'Should have at least the 3 aliases');
+  } finally {
     globalThis.fetch = originalFetch;
   }
 });

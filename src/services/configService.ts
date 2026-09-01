@@ -209,7 +209,7 @@ export function updateClaudeCodeSettings(cfg: ConfigSchema): void {
   const settingsFile = join(settingsDir, 'settings.json');
 
   if (enabled) {
-    const host = cfg.HOST || 'localhost';
+    const host = cfg.HOST || '127.0.0.1';
     const port = cfg.PORT || '26405';
     const baseUrl = `http://${host}:${port}`;
     const settings = {

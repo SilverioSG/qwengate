@@ -2,6 +2,7 @@ import assert from 'node:assert';
 import test from 'node:test';
 import { validateOpenAIRequest } from '../utils/validation.ts';
 import { buildFeatureConfig, resolveThinkingMode } from './qwen.ts';
+import { resolveModelAlias } from './modelAliases.ts';
 
 function thinkingFields(mode: 'fast' | 'auto' | 'thinking') {
   const config = buildFeatureConfig(mode);
@@ -92,4 +93,149 @@ test('validation: accepts thinking_mode and enableThinking request fields', () =
   assert.strictEqual(result.ok, true);
   assert.strictEqual(result.data?.thinking_mode, 'auto');
   assert.strictEqual(result.data?.enableThinking, true);
+});
+
+// ── Model alias tests ─────────────────────────────────────────
+
+test('resolveModelAlias: qwen3.8-max-fast resolves correctly', () => {
+  const result = resolveModelAlias('qwen3.8-max-fast');
+  assert.strictEqual(result.baseModel, 'qwen3.8-max');
+  assert.strictEqual(result.thinkingMode, 'fast');
+});
+
+test('resolveModelAlias: qwen3.8-max-auto resolves correctly', () => {
+  const result = resolveModelAlias('qwen3.8-max-auto');
+  assert.strictEqual(result.baseModel, 'qwen3.8-max');
+  assert.strictEqual(result.thinkingMode, 'auto');
+});
+
+test('resolveModelAlias: qwen3.8-max-thinking resolves correctly', () => {
+  const result = resolveModelAlias('qwen3.8-max-thinking');
+  assert.strictEqual(result.baseModel, 'qwen3.8-max');
+  assert.strictEqual(result.thinkingMode, 'thinking');
+});
+
+test('resolveModelAlias: unknown model passes through', () => {
+  const result = resolveModelAlias('qwen3.7-max');
+  assert.strictEqual(result.baseModel, 'qwen3.7-max');
+  assert.strictEqual(result.thinkingMode, undefined);
+});
+
+test('resolveModelAlias: alias + tools → auto, not fast', async () => {
+  const { buildQwenMessages } = await import('../routes/chatHelpers.ts');
+  const tools = [{ type: 'function', function: { name: 'bash', parameters: { type: 'object', properties: {} } } }];
+  const messages = [{ role: 'user', content: 'hello' }];
+
+  // Simulate what parseRequestBody does after alias resolution
+  const alias = resolveModelAlias('qwen3.8-max-auto');
+  const body: any = { model: alias.baseModel, tools };
+  if (alias.thinkingMode && !body.thinking_mode) {
+    body.thinking_mode = alias.thinkingMode;
+  }
+
+  const result = buildQwenMessages(messages, body, 100000, true);
+  assert.strictEqual(result.qwenMessages[0].feature_config.thinking_mode, 'Auto');
+});
+
+test('resolveModelAlias: fast alias + tools → Fast', async () => {
+  const { buildQwenMessages } = await import('../routes/chatHelpers.ts');
+  const tools = [{ type: 'function', function: { name: 'bash', parameters: { type: 'object', properties: {} } } }];
+  const messages = [{ role: 'user', content: 'hello' }];
+
+  const alias = resolveModelAlias('qwen3.8-max-fast');
+  const body: any = { model: alias.baseModel, tools };
+  if (alias.thinkingMode && !body.thinking_mode) {
+    body.thinking_mode = alias.thinkingMode;
+  }
+
+  const result = buildQwenMessages(messages, body, 100000, true);
+  assert.strictEqual(result.qwenMessages[0].feature_config.thinking_mode, 'Fast');
+});
+
+test('resolveModelAlias: auto alias + tools → Auto', async () => {
+  const { buildQwenMessages } = await import('../routes/chatHelpers.ts');
+  const tools = [{ type: 'function', function: { name: 'bash', parameters: { type: 'object', properties: {} } } }];
+  const messages = [{ role: 'user', content: 'hello' }];
+
+  const alias = resolveModelAlias('qwen3.8-max-auto');
+  const body: any = { model: alias.baseModel, tools };
+  if (alias.thinkingMode && !body.thinking_mode) {
+    body.thinking_mode = alias.thinkingMode;
+  }
+
+  const result = buildQwenMessages(messages, body, 100000, true);
+  assert.strictEqual(result.qwenMessages[0].feature_config.thinking_mode, 'Auto');
+});
+
+test('resolveModelAlias: thinking alias + tools → Thinking', async () => {
+  const { buildQwenMessages } = await import('../routes/chatHelpers.ts');
+  const tools = [{ type: 'function', function: { name: 'bash', parameters: { type: 'object', properties: {} } } }];
+  const messages = [{ role: 'user', content: 'hello' }];
+
+  const alias = resolveModelAlias('qwen3.8-max-thinking');
+  const body: any = { model: alias.baseModel, tools };
+  if (alias.thinkingMode && !body.thinking_mode) {
+    body.thinking_mode = alias.thinkingMode;
+  }
+
+  const result = buildQwenMessages(messages, body, 100000, true);
+  assert.strictEqual(result.qwenMessages[0].feature_config.thinking_mode, 'Thinking');
+});
+
+test('resolveModelAlias: alias + explicit override respects override', async () => {
+  const { buildQwenMessages } = await import('../routes/chatHelpers.ts');
+  const tools = [{ type: 'function', function: { name: 'bash', parameters: { type: 'object', properties: {} } } }];
+  const messages = [{ role: 'user', content: 'hello' }];
+
+  // Client sends alias + explicit thinking_mode=fast
+  const alias = resolveModelAlias('qwen3.8-max-auto');
+  const body: any = { model: alias.baseModel, tools, thinking_mode: 'fast' };
+  if (alias.thinkingMode && !body.thinking_mode) {
+    body.thinking_mode = alias.thinkingMode;
+  }
+
+  const result = buildQwenMessages(messages, body, 100000, true);
+  assert.strictEqual(result.qwenMessages[0].feature_config.thinking_mode, 'Fast');
+});
+
+test('qwen3.8-max without alias: behavior unchanged', async () => {
+  const { buildQwenMessages } = await import('../routes/chatHelpers.ts');
+  const tools = [{ type: 'function', function: { name: 'bash', parameters: { type: 'object', properties: {} } } }];
+  const messages = [{ role: 'user', content: 'hello' }];
+
+  const alias = resolveModelAlias('qwen3.8-max');
+  const body: any = { model: alias.baseModel, tools };
+  if (alias.thinkingMode && !body.thinking_mode) {
+    body.thinking_mode = alias.thinkingMode;
+  }
+
+  const result = buildQwenMessages(messages, body, 100000, true);
+  assert.strictEqual(result.qwenMessages[0].feature_config.thinking_mode, 'Fast');
+});
+
+test('validation: accepts qwen3.8-max-auto as model', () => {
+  const result = validateOpenAIRequest({
+    model: 'qwen3.8-max-auto',
+    messages: [{ role: 'user', content: 'hello' }],
+  });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.data?.model, 'qwen3.8-max-auto');
+});
+
+test('validation: accepts qwen3.8-max-fast as model', () => {
+  const result = validateOpenAIRequest({
+    model: 'qwen3.8-max-fast',
+    messages: [{ role: 'user', content: 'hello' }],
+  });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.data?.model, 'qwen3.8-max-fast');
+});
+
+test('validation: accepts qwen3.8-max-thinking as model', () => {
+  const result = validateOpenAIRequest({
+    model: 'qwen3.8-max-thinking',
+    messages: [{ role: 'user', content: 'hello' }],
+  });
+  assert.strictEqual(result.ok, true);
+  assert.strictEqual(result.data?.model, 'qwen3.8-max-thinking');
 });

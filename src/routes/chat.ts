@@ -4,6 +4,7 @@ import { decrementInFlight, pickAccount, throttleAccount } from '../services/aut
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
+import { resolveModelAlias } from '../services/modelAliases.ts';
 import {
   QwenUpstreamError,
   RetryableQwenStreamError,
@@ -51,6 +52,15 @@ async function parseRequestBody(c: Context) {
   }
 
   const body = validation.data as unknown as OpenAIRequest;
+
+  // ── Model alias resolution ──────────────────────────────────────
+  // Resolves aliases (e.g. qwen3.8-max-auto → qwen3.8-max + thinking_mode=auto)
+  // before any downstream logic consumes body.model or body.thinking_mode.
+  const alias = resolveModelAlias(body.model);
+  body.model = alias.baseModel;
+  if (alias.thinkingMode && !body.thinking_mode) {
+    body.thinking_mode = alias.thinkingMode;
+  }
 
   // Per-message size validation to prevent OOM during estimateTokens
   if (body.messages && Array.isArray(body.messages)) {

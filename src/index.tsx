@@ -15,6 +15,7 @@ import { getAccountCount, getAccountStats, getAccounts, getAvailableCount, initA
 import { closeScreencast, handleInputEvent, startScreencast } from './services/cdpScreencast.ts';
 import { config, updateClaudeCodeSettings } from './services/configService.ts';
 import { logStore } from './services/logStore.ts';
+import { getModelAliases } from './services/modelAliases.ts';
 import { configureAccount, fetchQwenModels } from './services/qwen.ts';
 import { getUsage, getUsageSummary, loadUsageStore } from './services/usageTracker.ts';
 import { safeCompare } from './utils/auth.ts';
@@ -239,7 +240,7 @@ app.get(
     try {
       const models = await fetchQwenModels();
       // OpenAI-compatible model object: standard fields + our extensions
-      const data = models.map((m: any) => ({
+      const upstreamData = models.map((m: any) => ({
         id: m.id,
         object: 'model' as const,
         created: m.created || Math.floor(Date.now() / 1000),
@@ -254,7 +255,22 @@ app.get(
         description: m.description || '',
         capabilities: m.capabilities || {},
       }));
-      return c.json({ object: 'list', data });
+
+      // Inject model aliases (e.g. qwen3.8-max-auto) inheriting base model metadata
+      const aliases = getModelAliases();
+      const aliasData = Object.entries(aliases).map(([id, config]) => {
+        const base = upstreamData.find((m) => m.id === config.baseModel);
+        if (!base) return null;
+        return {
+          ...base,
+          id,
+          root: config.baseModel,
+          parent: config.baseModel,
+          description: `Alias for ${config.baseModel} (thinking_mode=${config.thinkingMode})`,
+        };
+      }).filter(Boolean);
+
+      return c.json({ object: 'list', data: aliasData });
     } catch (err: any) {
       return c.json({ error: { message: err.message } }, 500);
     }
@@ -271,7 +287,7 @@ if (import.meta.main) {
 
   const port = config.getPort();
   const hostArg = process.argv.indexOf('--host');
-  const host = hostArg !== -1 && process.argv[hostArg + 1] ? process.argv[hostArg + 1] : config.get('HOST') || 'localhost';
+  const host = hostArg !== -1 && process.argv[hostArg + 1] ? process.argv[hostArg + 1] : config.get('HOST') || '127.0.0.1';
 
   // Show banner immediately on startup
   process.stdout.write(`\x1b[31m
