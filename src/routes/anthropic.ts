@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
-import { pickAccount, throttleAccount } from '../services/auth.ts';
+import { decrementInFlight, decrementModelRequests, incrementModelRequests, pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
@@ -371,6 +371,7 @@ async function setupAnthropicSession(
         imageFiles.push(...results.filter((f): f is QwenFileAttachment => f !== null));
       }
       if (imageFiles.length === 0) {
+        if (accountEmail) decrementInFlight(accountEmail);
         throw new Error('Failed to upload images — none could be uploaded');
       }
     }
@@ -389,6 +390,7 @@ async function setupAnthropicSession(
         // next account (upload failure is per-account); if all exhaust, the
         // loop throws a real error instead of silently sending inline.
         logStore.log('error', 'chat', `[Anthropic] Context file upload failed for ${accountEmail}: ${err.message || err}`);
+        if (accountEmail) decrementInFlight(accountEmail);
         lastFailedEmail = accountEmail;
         lastError = err;
         continue;
@@ -445,6 +447,12 @@ async function setupAnthropicSession(
       logStore.addError(logId, `Stream creation failed for ${resolvedEmail}: ${err.message || String(err)}`);
       if (err.upstreamStatus === 429 || /RateLimited|daily usage limit/i.test(err.message || '')) {
         logStore.log('warn', 'chat', `[Anthropic]   -> rate-limited, trying next account`);
+        lastFailedEmail = resolvedEmail;
+        lastError = err;
+        continue;
+      }
+      if (err.upstreamCode === 'quota_limit' || /quota_limit/i.test(err.message || '')) {
+        logStore.log('warn', 'chat', `[Anthropic]   -> quota_limit, trying next account`);
         lastFailedEmail = resolvedEmail;
         lastError = err;
         continue;
@@ -1000,6 +1008,7 @@ async function handleAnthropicStream(
 export async function anthropicMessages(c: Context) {
   const logId = crypto.randomUUID();
   const _requestStartTime = Date.now();
+  incrementModelRequests();
 
   // Watchdog: log if request hangs without response
   const watchdogTimer = setTimeout(() => {
@@ -1219,5 +1228,7 @@ export async function anthropicMessages(c: Context) {
     cancelWatchdog();
     if (anthropicVersion) c.header('anthropic-version', anthropicVersion);
     return c.json({ error: { message: cleanMessage, type: err.type || 'server_error', code: err.code || undefined } }, <any>status);
+  } finally {
+    decrementModelRequests();
   }
 }

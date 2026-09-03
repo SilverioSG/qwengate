@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { Context } from 'hono';
-import { decrementInFlight, pickAccount, throttleAccount } from '../services/auth.ts';
+import { decrementInFlight, decrementModelRequests, incrementModelRequests, pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
@@ -212,6 +212,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         imageFiles.push(...results.filter((f): f is QwenFileAttachment => f !== null));
       }
       if (imageFiles.length === 0) {
+        if (accountEmail) decrementInFlight(accountEmail);
         throw new Error('Failed to upload images — none of the image files could be uploaded');
       }
     }
@@ -233,6 +234,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         // next account (upload failure is per-account); if all exhaust, the
         // loop throws a real error instead of silently sending inline.
         logStore.log('error', 'chat', `[Chat] Context file upload failed for ${accountEmail}: ${err.message || err}`);
+        if (accountEmail) decrementInFlight(accountEmail);
         lastFailedEmail = accountEmail;
         lastError = err;
         continue;
@@ -296,6 +298,12 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
 
       // If rate limited, try next account — Qwen didn't process the request yet
       if (err.upstreamStatus === 429 || /RateLimited|daily usage limit/i.test(err.message || '')) {
+        lastFailedEmail = resolvedEmail;
+        lastError = err;
+        continue;
+      }
+      // quota_limit: upstream capacity exhausted — rotate without throttling the account
+      if (err.upstreamCode === 'quota_limit' || /quota_limit/i.test(err.message || '')) {
         lastFailedEmail = resolvedEmail;
         lastError = err;
         continue;
@@ -386,6 +394,23 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
           'chat',
           `[Chat] Mid-payload RateLimited on ${resolvedEmail} (${routedModel}) — no alternative account available`,
         );
+      } else if (wall?.code === 'quota_limit') {
+        const alternative = await pickAccount(resolvedEmail);
+        if (alternative) {
+          decrementInFlight(alternative.email);
+          logStore.log('warn', 'chat', `[Chat] Pre-emission quota_limit on ${resolvedEmail} (${routedModel}) — rotating account`);
+          streamReader.cancel().catch(() => {});
+          qwenAbortController?.abort();
+          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+          lastFailedEmail = resolvedEmail;
+          lastError = new QwenUpstreamError(wall.message, 'quota_limit', 502);
+          continue;
+        }
+        logStore.log(
+          'warn',
+          'chat',
+          `[Chat] Pre-emission quota_limit on ${resolvedEmail} (${routedModel}) — no alternative account available`,
+        );
       } else if (wall) {
         // Other upstream errors (internal_error, etc.) in first chunk — rotate pre-content
         logStore.log('warn', 'chat', `[Chat] First-chunk upstream error on ${resolvedEmail}: ${wall.code} — rotating account`);
@@ -472,6 +497,7 @@ function populateLogEntry(logEntry: any, body: OpenAIRequest, messages: any[]): 
 export async function chatCompletions(c: Context) {
   const logId = crypto.randomUUID();
   const _requestStartTime = Date.now();
+  incrementModelRequests();
   try {
     const parsed = await parseRequestBody(c);
     const { body, isStream, toolCalling, cleanOutput, messages, contextCheck } = parsed;
@@ -532,11 +558,13 @@ export async function chatCompletions(c: Context) {
           });
         } catch (err: any) {
           const retryable =
-            err instanceof QwenUpstreamError && err.upstreamCode === 'RateLimited' && midBodyAttempt < MAX_MID_BODY_RETRIES - 1;
+            err instanceof QwenUpstreamError &&
+            (err.upstreamCode === 'RateLimited' || err.upstreamCode === 'quota_limit') &&
+            midBodyAttempt < MAX_MID_BODY_RETRIES - 1;
           logStore.log(
             'warn',
             'chat',
-            `[Chat] Mid-body RateLimited — ${retryable ? `rotating account (${midBodyAttempt + 1}/${MAX_MID_BODY_RETRIES})` : 'no rotation possible'}`,
+            `[Chat] Mid-body ${err.upstreamCode || 'error'} — ${retryable ? `rotating account (${midBodyAttempt + 1}/${MAX_MID_BODY_RETRIES})` : 'no rotation possible'}`,
           );
           if (retryable) continue;
           throw err;
@@ -603,5 +631,7 @@ export async function chatCompletions(c: Context) {
       },
       status,
     );
+  } finally {
+    decrementModelRequests();
   }
 }

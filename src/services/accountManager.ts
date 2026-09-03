@@ -407,6 +407,7 @@ export function setupAccountWatcher(): void {
  */
 export function enableHotReload(): void {
   setupAccountWatcher();
+  startStaleInFlightCleanup();
 }
 export function resetWatcherState(): void {
   watcherReady = false;
@@ -498,6 +499,53 @@ export function incrementTotalRequests(email: string): void {
 export function hasInFlight(email: string): boolean {
   const acct = getAccountByEmail(email);
   return acct ? acct.inFlight > 0 : false;
+}
+
+const STALE_INFLIGHT_THRESHOLD_MS = 120_000;
+let staleCleanupTimer: ReturnType<typeof setInterval> | null = null;
+let modelRequestsInFlight = 0;
+
+export function incrementModelRequests(): void {
+  modelRequestsInFlight++;
+}
+
+export function decrementModelRequests(): void {
+  if (modelRequestsInFlight > 0) modelRequestsInFlight--;
+}
+
+export function getModelRequestsInFlight(): number {
+  return modelRequestsInFlight;
+}
+
+export function cleanupStaleInFlight(): number {
+  const now = Date.now();
+  let resetCount = 0;
+  for (const acct of accounts) {
+    if (acct.inFlight > 0 && acct.lastInFlightAt && now - acct.lastInFlightAt > STALE_INFLIGHT_THRESHOLD_MS) {
+      if (modelRequestsInFlight > 0) {
+        logStore.log(
+          'debug',
+          'auth',
+          `[Account] Stale cleanup skipped for ${acct.email}: model requests still active (${modelRequestsInFlight})`,
+        );
+        continue;
+      }
+      logStore.log(
+        'warn',
+        'auth',
+        `[Account] Stale inFlight cleanup: ${acct.email} was ${acct.inFlight}, stuck for ${Math.round((now - acct.lastInFlightAt) / 1000)}s`,
+      );
+      acct.inFlight = 0;
+      resetCount++;
+    }
+  }
+  return resetCount;
+}
+
+export function startStaleInFlightCleanup(): void {
+  if (staleCleanupTimer) return;
+  staleCleanupTimer = setInterval(cleanupStaleInFlight, 30_000);
+  if (staleCleanupTimer && typeof staleCleanupTimer.unref === 'function') staleCleanupTimer.unref();
 }
 export function getAccountByEmail(email: string): AccountEntry | null {
   return emailIndex.get(email.toLowerCase().trim()) || null;

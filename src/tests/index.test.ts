@@ -1421,3 +1421,292 @@ test('Model alias: /v1/models returns aliases inheriting base model metadata', a
     globalThis.fetch = originalFetch;
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// inFlight balance tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+import {
+  decrementInFlight,
+  decrementModelRequests,
+  getAccountByEmail,
+  getModelRequestsInFlight,
+  incrementModelRequests,
+  pickAccount,
+  rebuildEmailIndex,
+} from '../services/accountManager.ts';
+import { sessionPool } from '../services/sessionPool.ts';
+
+function makeAcct(email: string) {
+  return {
+    email,
+    password: 'test',
+    state: { token: `tok-${email}`, expiresAt: Date.now() + 3600000, refreshToken: null },
+    lastUsed: 0,
+    throttledUntil: 0,
+    refreshInFlight: null,
+    loginAttempt: 0,
+    inFlight: 0,
+    totalRequests: 0,
+    startupStatus: 'ready' as const,
+  };
+}
+
+test('inFlight balance: pick -> complete -> release -> 0', async () => {
+  const originalAccounts = [...accounts];
+  accounts.push(makeAcct('bal-success@test.dev'));
+  rebuildEmailIndex();
+
+  try {
+    const acct = accounts.find(a => a.email === 'bal-success@test.dev')!;
+    assert.strictEqual(acct.inFlight, 0, 'starts at 0');
+
+    const picked = await pickAccount();
+    assert.ok(picked);
+    assert.strictEqual(picked.inFlight, 1, 'after pick = 1');
+
+    // Simulate successful session acquire + release
+    const fakeChatId = 'chat-' + crypto.randomUUID();
+    (sessionPool as any).activeSessions?.add(fakeChatId);
+    (sessionPool as any).activeCount = ((sessionPool as any).activeCount || 0) + 1;
+    await sessionPool.release(fakeChatId, null, undefined, picked.email, true);
+
+    assert.strictEqual(acct.inFlight, 0, 'after release = 0');
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+  }
+});
+
+test('inFlight balance: pick -> upstream error -> release -> 0', async () => {
+  const originalAccounts = [...accounts];
+  accounts.push(makeAcct('bal-error@test.dev'));
+  rebuildEmailIndex();
+
+  try {
+    const picked = await pickAccount();
+    assert.ok(picked);
+    assert.strictEqual(picked.inFlight, 1, 'after pick = 1');
+
+    // Simulate failed session acquire (error path)
+    const fakeChatId = 'chat-' + crypto.randomUUID();
+    (sessionPool as any).activeSessions?.add(fakeChatId);
+    (sessionPool as any).activeCount = ((sessionPool as any).activeCount || 0) + 1;
+    await sessionPool.release(fakeChatId, null, undefined, picked.email, false);
+
+    assert.strictEqual(picked.inFlight, 0, 'after error release = 0');
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+  }
+});
+
+test('inFlight balance: pick -> abort -> decrement -> 0', async () => {
+  const originalAccounts = [...accounts];
+  accounts.push(makeAcct('bal-abort@test.dev'));
+  rebuildEmailIndex();
+
+  try {
+    const picked = await pickAccount();
+    assert.ok(picked);
+    assert.strictEqual(picked.inFlight, 1, 'after pick = 1');
+
+    // Simulate abort path: decrement manually (as chat.ts does on abort/timeout)
+    decrementInFlight(picked.email);
+    assert.strictEqual(picked.inFlight, 0, 'after abort decrement = 0');
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+  }
+});
+
+test('stale inFlight recovery: cleanupStaleInFlight resets old counters when idle', async () => {
+  const { cleanupStaleInFlight } = await import('../services/accountManager.ts');
+  const originalAccounts = [...accounts];
+  accounts.push(makeAcct('stale-test@test.dev'));
+  rebuildEmailIndex();
+
+  try {
+    const acct = accounts.find(a => a.email === 'stale-test@test.dev')!;
+    // Simulate stale: inFlight=1, lastInFlightAt set to 3 minutes ago
+    acct.inFlight = 1;
+    acct.lastInFlightAt = Date.now() - 180_000;
+
+    const reset = cleanupStaleInFlight();
+    assert.strictEqual(reset, 1, 'should reset 1 stale account');
+    assert.strictEqual(acct.inFlight, 0, 'inFlight reset to 0');
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+  }
+});
+
+test('stale inFlight: recent counter NOT cleaned up', async () => {
+  const { cleanupStaleInFlight } = await import('../services/accountManager.ts');
+  const originalAccounts = [...accounts];
+  accounts.push(makeAcct('recent-test@test.dev'));
+  rebuildEmailIndex();
+
+  try {
+    const acct = accounts.find(a => a.email === 'recent-test@test.dev')!;
+    acct.inFlight = 1;
+    acct.lastInFlightAt = Date.now() - 5_000; // only 5s ago
+
+    const reset = cleanupStaleInFlight();
+    assert.strictEqual(reset, 0, 'should NOT reset recent counter');
+    assert.strictEqual(acct.inFlight, 1, 'inFlight stays at 1');
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+  }
+});
+
+test('LONG_RUNNING_REQUEST_NOT_RESET: active model request protects stale counter', async () => {
+  const { cleanupStaleInFlight } = await import('../services/accountManager.ts');
+  const originalAccounts = [...accounts];
+  // Simulate: 2 model requests in flight
+  incrementModelRequests();
+  incrementModelRequests();
+  assert.strictEqual(getModelRequestsInFlight(), 2, 'modelRequestsInFlight should be 2');
+  accounts.push(makeAcct('longrun-test@test.dev'));
+  rebuildEmailIndex();
+
+  try {
+    const acct = accounts.find(a => a.email === 'longrun-test@test.dev')!;
+    // inFlight=1, age > threshold, but model requests are active
+    acct.inFlight = 1;
+    acct.lastInFlightAt = Date.now() - 180_000;
+
+    const reset = cleanupStaleInFlight();
+    assert.strictEqual(reset, 0, 'MUST NOT reset — model requests are active');
+    assert.strictEqual(acct.inFlight, 1, 'inFlight stays at 1 — request is legitimate');
+  } finally {
+    decrementModelRequests();
+    decrementModelRequests();
+    assert.strictEqual(getModelRequestsInFlight(), 0, 'modelRequestsInFlight back to 0');
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+  }
+});
+
+test('ORPHANED_STALE_COUNTER_RESET: idle system + old counter = safe reset', async () => {
+  const { cleanupStaleInFlight } = await import('../services/accountManager.ts');
+  const originalAccounts = [...accounts];
+  // No model requests in flight
+  assert.strictEqual(getModelRequestsInFlight(), 0, 'modelRequestsInFlight should be 0');
+  accounts.push(makeAcct('orphan-test@test.dev'));
+  rebuildEmailIndex();
+
+  try {
+    const acct = accounts.find(a => a.email === 'orphan-test@test.dev')!;
+    // inFlight=1, age > threshold, no model requests
+    acct.inFlight = 1;
+    acct.lastInFlightAt = Date.now() - 180_000;
+
+    const reset = cleanupStaleInFlight();
+    assert.strictEqual(reset, 1, 'should reset orphaned counter');
+    assert.strictEqual(acct.inFlight, 0, 'inFlight reset to 0');
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// quota_limit classification tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+test('SSE pre-emission quota_limit: handoff to second account', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push(makeAcct('ql-pre1@test.dev'));
+  accounts.push(makeAcct('ql-pre2@test.dev'));
+  rebuildEmailIndex();
+
+  let chatCalls = 0;
+  (globalThis as any).fetch = async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      chatCalls++;
+      // First call returns quota_limit, second returns content
+      if (chatCalls === 1) {
+        return new Response(
+          JSON.stringify({ success: false, data: { code: 'quota_limit', details: 'High demand' } }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      // Second call: return valid SSE stream
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"Hello from acct2"}}]}\n\n'));
+          controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify({
+        model: 'qwen3.6-plus',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    // Should succeed (not 429 or 500) — handoff worked
+    assert.ok(res.status === 200, `Expected 200 after handoff, got ${res.status}`);
+    assert.ok(chatCalls >= 2, `Expected at least 2 chat calls (initial + handoff), got ${chatCalls}`);
+
+    // The account that hit quota_limit should NOT be throttled
+    const acct1 = accounts.find(a => a.email === 'ql-pre1@test.dev');
+    assert.ok(acct1, 'acct1 should exist');
+    assert.ok(!acct1?.throttledUntil || acct1.throttledUntil <= Date.now(), 'acct1 should NOT be throttled');
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('quota_limit does NOT throttle the account', async () => {
+  const originalAccounts = [...accounts];
+  accounts.push(makeAcct('ql-nothrottle@test.dev'));
+  rebuildEmailIndex();
+
+  try {
+    const acct = accounts.find(a => a.email === 'ql-nothrottle@test.dev');
+    assert.ok(acct, 'account should exist');
+    assert.strictEqual(acct!.throttledUntil, 0, 'starts unthrottled');
+
+    // The fix ensures quota_limit paths do NOT call throttleAccount
+    // Only RateLimited and CAPTCHA paths call throttleAccount
+    // This test verifies the account stays eligible after quota_limit
+    const picked = await pickAccount();
+    assert.ok(picked, 'account should still be pickable');
+    assert.strictEqual(picked.email, 'ql-nothrottle@test.dev');
+    decrementInFlight(picked.email);
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+  }
+});

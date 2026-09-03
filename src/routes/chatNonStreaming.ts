@@ -382,6 +382,18 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
       );
     }
   }
+  if (errorCode === 'quota_limit') {
+    const alternative = await pickAccount(ctx.resolvedEmail);
+    if (alternative) {
+      decrementInFlight(alternative.email);
+      logStore.log('warn', 'chat', `[Chat] Mid-body quota_limit on ${ctx.resolvedEmail} — rotating account`);
+      throw new QwenUpstreamError(
+        parsedError?.message ?? state.upstreamErrorMessage ?? 'Qwen upstream error: quota_limit',
+        'quota_limit',
+        502,
+      );
+    }
+  }
   if (parsedError) {
     logStore.finalizeRequest(logId);
     const cleanMessage = cleanTextOfXmlArtifacts(parsedError.message).cleanedText || parsedError.message;
