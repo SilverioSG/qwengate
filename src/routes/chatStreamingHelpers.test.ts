@@ -500,3 +500,83 @@ test('local_tool finished returns break_stream and emits tool_call without conte
   const contentEvents = writtenEvents.filter((e) => !e.includes('tool_calls') && e.includes('"content"'));
   assert.strictEqual(contentEvents.length, 0, 'no content events should leak during local_tool finished');
 });
+
+test('finished chunk with content delta (no local_tool) preserves content', async () => {
+  const logId = 'test-finished-content-preserve';
+  logStore.createEntry(logId, 'qwen3.8-max', true);
+
+  const state: StreamProcessingState = {
+    targetResponseId: null,
+    nextParentId: null,
+    completionTokens: 0,
+    promptTokens: 0,
+    currentThoughtIndex: 0,
+    reasoningBuffer: '',
+    lastFullContent: '',
+    lastRawContent: '',
+    lastFilteredSnapshot: '',
+    lastThinkingSnapshot: '',
+    lastVStrRaw: '',
+    lastFilteredFullContent: '',
+    lastDeltaThinkingFull: '',
+    loggedToolCalls: new Set(),
+    lastParsePosition: 0,
+    toolCallDepth: 0,
+    pendingChunk: '',
+    hasEmittedContent: false,
+    answerChunkCount: 0,
+    nonEmptyAnswerCount: 0,
+    reasoningChunkCount: 0,
+    upstreamError: undefined,
+  };
+
+  const writtenEvents: string[] = [];
+  const mockStreamWriter = {
+    write: async (chunk: string) => {
+      writtenEvents.push(chunk);
+    },
+  };
+
+  const ctx: StreamProcessingCtx = {
+    streamWriter: mockStreamWriter,
+    completionId: 'test-completion-finished-content',
+    model: 'qwen3.8-max',
+    emittedToolCallCount: 0,
+    enableContentFiltering: false,
+    cleanOutput: false,
+    logId: logId,
+    resolvedEmail: 'test@example.com',
+    ampState: {
+      rawInputBytes: 0,
+      emittedOutputBytes: 0,
+      triggered: false,
+    },
+    qwenAbortController: new AbortController(),
+  };
+
+  const finishedChunkWithContent = {
+    choices: [
+      {
+        delta: {
+          status: 'finished',
+          phase: 'answer',
+          content: 'Final sentence of the response.',
+        },
+      },
+    ],
+  };
+
+  const result = await processStreamData(finishedChunkWithContent, state, ctx);
+
+  assert.strictEqual(result, 'break_stream', 'finished chunk must return break_stream');
+
+  const contentEvents = writtenEvents.filter((e) => e.includes('"content"') && !e.includes('tool_calls'));
+  assert.ok(
+    contentEvents.length > 0,
+    `content delta in finished chunk must be emitted, not lost. Events: ${JSON.stringify(writtenEvents)}`,
+  );
+
+  const parsed = JSON.parse(contentEvents[0].replace(/^data: /, ''));
+  const delta = parsed.choices?.[0]?.delta;
+  assert.strictEqual(delta?.content, 'Final sentence of the response.', 'content text must match the delta payload');
+});
