@@ -1,4 +1,6 @@
+import { buildAnomalyRecord, recordAnomaly } from '../services/anomalyLog.ts';
 import { config } from '../services/configService.ts';
+import { EMPTY_UPSTREAM_CODE, isEmptyOutput, isShortContent, isYesOnly } from '../services/emptyOutput.ts';
 import { logStore } from '../services/logStore.ts';
 import { reportRateLimitWall } from '../services/qwen.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls } from '../tools/xmlToolParser.ts';
@@ -231,6 +233,34 @@ export async function handlePostStreamCompletion(
         // Don't append [Error] text — the partial answer stays visible and the
         // stream finishes cleanly with stop. Log the error server-side only.
         logStore.log('warn', 'chat', `[Chat] Post-content upstream error on ${resolvedEmail}: ${upstreamError.message} — finishing stream`);
+        // Detector: extremely short content followed by a post-content upstream
+        // error — persist structural evidence, keep the existing wire behavior.
+        const postContentText = (flushCleaned || '').trim();
+        if (postContentText && isShortContent(postContentText) && effectiveToolCallCount === 0) {
+          recordAnomaly(
+            buildAnomalyRecord('short_then_error', {
+              logId,
+              requestId: completionId,
+              model,
+              account: resolvedEmail,
+              stream: true,
+              rawAnswerText: streamState.lastFullContent,
+              gateFinalText: flushCleaned || '',
+              finalContentLength: (flushCleaned || '').length,
+              reasoningLength: streamState.reasoningBuffer.length,
+              toolCallCount: effectiveToolCallCount,
+              rawAnswerChunkCount: streamState.answerChunkCount,
+              nonEmptyAnswerChunkCount: streamState.nonEmptyAnswerCount,
+              reasoningChunkCount: streamState.reasoningChunkCount,
+              hasEmittedContent: streamState.hasEmittedContent,
+              upstreamErrorClass: upstreamCode ?? null,
+              upstreamErrorAfterContent: true,
+              finishStatus: 'stop',
+              streamEOF: true,
+              streamTimeout: false,
+            }),
+          );
+        }
       } else {
         // Pre-content error: no content was emitted yet.
         // Write the error as a content chunk so the client knows what happened.
@@ -242,6 +272,96 @@ export async function handlePostStreamCompletion(
       logStore.updateEntry(logId, (entry) => {
         entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
         entry.finalResponse.finishReason = 'upstream_error';
+      });
+      logStore.finalizeRequest(logId);
+      return;
+    }
+
+    // ── Yes-only detector (observability only — wire behavior unchanged) ──
+    const finalTextForYes = (flushCleaned || '').trim();
+    if (effectiveToolCallCount === 0 && finalTextForYes && isYesOnly(finalTextForYes)) {
+      logStore.log('warn', 'chat', `[Chat] Yes-only response detected for ${logId} — recording anomaly`);
+      recordAnomaly(
+        buildAnomalyRecord('yes_only', {
+          logId,
+          requestId: completionId,
+          model,
+          account: resolvedEmail,
+          stream: true,
+          rawAnswerText: streamState.lastFullContent,
+          gateFinalText: flushCleaned || '',
+          finalContentLength: (flushCleaned || '').length,
+          reasoningLength: streamState.reasoningBuffer.length,
+          toolCallCount: effectiveToolCallCount,
+          rawAnswerChunkCount: streamState.answerChunkCount,
+          nonEmptyAnswerChunkCount: streamState.nonEmptyAnswerCount,
+          reasoningChunkCount: streamState.reasoningChunkCount,
+          hasEmittedContent: streamState.hasEmittedContent,
+          upstreamErrorClass: upstreamCode ?? null,
+          upstreamErrorAfterContent: false,
+          finishStatus: 'stop',
+          streamEOF: true,
+          streamTimeout: false,
+        }),
+      );
+    }
+
+    // ── Zero-output guard ───────────────────────────────────────────────
+    // Precedence: classified upstream errors returned above; valid tool calls
+    // and valid reasoning/content skip via isEmptyOutput. A fully empty upstream
+    // response must not close as a normal successful empty turn.
+    if (
+      isEmptyOutput({
+        content: flushCleaned || '',
+        reasoning: flushThinking || streamState.reasoningBuffer,
+        toolCallCount: effectiveToolCallCount,
+      }) &&
+      !streamWriter.aborted &&
+      !streamWriter.closed
+    ) {
+      const emptyMsg =
+        'Upstream returned empty response with no content, reasoning, or tool calls. Try starting a new conversation or reducing history.';
+      logStore.log('warn', 'stream', `[Stream] Empty upstream response for ${logId} (code=${EMPTY_UPSTREAM_CODE})`);
+      logStore.addError(logId, 'Empty upstream response — no content, reasoning, or tool calls');
+      recordAnomaly(
+        buildAnomalyRecord('empty_upstream', {
+          logId,
+          requestId: completionId,
+          model,
+          account: resolvedEmail,
+          stream: true,
+          rawAnswerText: streamState.lastFullContent,
+          gateFinalText: '',
+          finalContentLength: 0,
+          reasoningLength: streamState.reasoningBuffer.length,
+          toolCallCount: effectiveToolCallCount,
+          rawAnswerChunkCount: streamState.answerChunkCount,
+          nonEmptyAnswerChunkCount: streamState.nonEmptyAnswerCount,
+          reasoningChunkCount: streamState.reasoningChunkCount,
+          hasEmittedContent: streamState.hasEmittedContent,
+          upstreamErrorClass: upstreamCode ?? null,
+          upstreamErrorAfterContent: false,
+          finishStatus: EMPTY_UPSTREAM_CODE,
+          streamEOF: true,
+          streamTimeout: false,
+        }),
+      );
+      await writeEvent(streamWriter, { error: { message: emptyMsg, type: 'server_error', code: EMPTY_UPSTREAM_CODE } });
+      const usageEmpty = buildUsage(streamState.promptTokens, streamState.completionTokens, streamState.reasoningBuffer);
+      await writeEvent(
+        streamWriter,
+        buildChunkEvent(completionId, model, [makeChoice({}, 'stop')], includeUsage ? undefined : { usage: usageEmpty }),
+      );
+      if (includeUsage) {
+        await writeEvent(streamWriter, buildChunkEvent(completionId, model, [], { usage: usageEmpty }));
+      }
+      await streamWriter.write('data: [DONE]\n\n');
+      checkFinalAmplification(ampState, logId, resolvedEmail, logStore);
+      logStore.updateEntry(logId, (entry) => {
+        const now = Date.now();
+        const startedAt = new Date(entry.timestamp).getTime();
+        if (startedAt) entry.latency_ms = now - startedAt;
+        entry.finalResponse = { finishReason: EMPTY_UPSTREAM_CODE, toolCallCount: 0, contentPreview: '' };
       });
       logStore.finalizeRequest(logId);
       return;
@@ -294,15 +414,6 @@ export async function handlePostStreamCompletion(
     }
   } finally {
     // Always release session to prevent pool exhaustion, even if writeEvent fails
-    scheduleCleanup(
-      reader,
-      heartbeatInterval,
-      chatId,
-      streamState.nextParentId,
-      sessionHeaders,
-      email,
-      sessionPool,
-      true,
-    );
+    scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool, true);
   }
 }

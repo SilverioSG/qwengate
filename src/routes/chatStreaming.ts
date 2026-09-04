@@ -194,5 +194,8 @@ function buildInitialStreamState(finalPrompt: string, initialParentId: string | 
     toolCallDepth: 0,
     pendingChunk: '',
     hasEmittedContent: false,
+    answerChunkCount: 0,
+    nonEmptyAnswerCount: 0,
+    reasoningChunkCount: 0,
   };
 }

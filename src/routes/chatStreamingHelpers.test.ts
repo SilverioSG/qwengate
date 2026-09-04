@@ -25,6 +25,7 @@ test('reproduces and tests fix for corrupted tool call when split across chunks'
     lastParsePosition: 0,
     toolCallDepth: 0,
     pendingChunk: '',
+    hasEmittedContent: false,
   };
 
   const writtenEvents: string[] = [];
@@ -160,6 +161,7 @@ test('one-chunk buffer: delays chunks with < but no > and combines with next chu
     lastParsePosition: 0,
     toolCallDepth: 0,
     pendingChunk: '',
+    hasEmittedContent: false,
   };
 
   const writtenEvents: string[] = [];
@@ -243,6 +245,7 @@ test('one-chunk buffer: releases non-tool-call < content normally', async () => 
     lastParsePosition: 0,
     toolCallDepth: 0,
     pendingChunk: '',
+    hasEmittedContent: false,
   };
 
   const writtenEvents: string[] = [];
@@ -341,6 +344,7 @@ test('one-chunk buffer: force-releases when MAX_BUFFER_CHARS exceeded', async ()
     lastParsePosition: 0,
     toolCallDepth: 0,
     pendingChunk: '',
+    hasEmittedContent: false,
   };
 
   const writtenEvents: string[] = [];
@@ -433,6 +437,7 @@ test('local_tool finished returns break_stream and emits tool_call without conte
     lastParsePosition: 0,
     toolCallDepth: 0,
     pendingChunk: '',
+    hasEmittedContent: false,
   };
 
   const writtenEvents: string[] = [];

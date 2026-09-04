@@ -1,8 +1,10 @@
 import crypto from 'node:crypto';
 import { Context } from 'hono';
 import { stream as honoStream } from 'hono/streaming';
+import { buildAnomalyRecord, recordAnomaly } from '../services/anomalyLog.ts';
 import { decrementInFlight, decrementModelRequests, incrementModelRequests, pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
+import { EMPTY_UPSTREAM_CODE, isEmptyOutput, isShortContent, isYesOnly } from '../services/emptyOutput.ts';
 import { logStore } from '../services/logStore.ts';
 import { modelRouter } from '../services/modelRouter.ts';
 import { RetryableQwenStreamError } from '../services/qwen.ts';
@@ -19,6 +21,7 @@ import {
   extractDeltaContent,
   getModelSpecs,
   handleImageModelFallback,
+  parseQwenErrorPayload,
 } from './chatHelpers.ts';
 import type { NonStreamingContext } from './chatNonStreaming.ts';
 import { handleNonStreamingRequest } from './chatNonStreaming.ts';
@@ -337,6 +340,9 @@ async function setupAnthropicSession(
   let lastFailedEmail: string | undefined;
   const isThinkingModel = !body.model.includes('no-thinking');
   let lastError: any;
+  // Anomaly observability across account attempts (hard-fail/rotation unchanged).
+  let contextFileUsed = false;
+  let contextUploadFailed = false;
 
   for (let attempt = 0; attempt < MAX_ACCOUNT_RETRIES; attempt++) {
     const selectedAccount = await pickAccount(lastFailedEmail);
@@ -384,6 +390,7 @@ async function setupAnthropicSession(
       try {
         const file = await uploadLargeTextAsFile(accountEmail, parts.join('\n\n'), 'context.txt');
         processedMessages[0] = { ...processedMessages[0], files: [file] };
+        contextFileUsed = true;
       } catch (err: any) {
         // NEVER fall back to sending the payload inline: Qwen bot-detects
         // oversized user messages and the request hangs/spins. Retry on the
@@ -393,6 +400,7 @@ async function setupAnthropicSession(
         if (accountEmail) decrementInFlight(accountEmail);
         lastFailedEmail = accountEmail;
         lastError = err;
+        contextUploadFailed = true;
         continue;
       }
     }
@@ -422,6 +430,10 @@ async function setupAnthropicSession(
     logStore.log('debug', 'chat', `[Anthropic] Session acquired: ${resolvedEmail} chatId=${session.chatId}`);
     logStore.updateEntry(logId, (entry) => {
       entry.accountEmail = resolvedEmail;
+      entry.contextFlags = {
+        contextFileUsed,
+        contextUploadFailed,
+      };
     });
 
     let streamResult;
@@ -555,7 +567,7 @@ async function setupAnthropicSession(
 
 // ── Anthropic SSE streaming ────────────────────────────────────────
 
-async function handleAnthropicStream(
+export async function handleAnthropicStream(
   c: Context,
   anthropicModel: string,
   logId: string,
@@ -603,6 +615,13 @@ async function handleAnthropicStream(
       let localToolCallsAccum: any[] = [];
       let hasEmittedContent = false;
       let textBlockIndex = 0;
+      // Anomaly observability: transport-level abort must not be mistaken for
+      // a clean empty upstream response (error precedence for short content).
+      let streamAborted = false;
+      let rawAnswerChunkCount = 0;
+      let nonEmptyAnswerCount = 0;
+      let reasoningChunkCount = 0;
+      let upstreamError: { code: string; message: string } | null = null;
 
       const STREAM_IDLE_TIMEOUT = Math.max(10_000, config.getInt('STREAM_IDLE_TIMEOUT_MS', 60_000));
 
@@ -621,6 +640,7 @@ async function handleAnthropicStream(
           ]);
         } catch (streamErr: any) {
           logStore.log('warn', 'chat', `[Anthropic] ${streamErr.message || 'Stream read error'} (logId=${logId})`);
+          streamAborted = true;
           break;
         } finally {
           if (idleTimer) clearTimeout(idleTimer);
@@ -644,6 +664,25 @@ async function handleAnthropicStream(
           } catch {
             continue;
           }
+          const parsedChunkError = parseQwenErrorPayload(dataStr);
+          if (parsedChunkError) {
+            upstreamError = {
+              code: parsedChunkError.code || 'UpstreamError',
+              message: parsedChunkError.message,
+            };
+            logStore.addError(logId, parsedChunkError.message);
+            continue;
+          }
+          const deltaStatus = chunk.choices?.[0]?.delta?.status;
+          if (deltaStatus === 'error') {
+            const delta = chunk.choices[0].delta;
+            upstreamError = {
+              code: delta.code || 'UpstreamError',
+              message: delta.message || 'Qwen stream delta returned error status',
+            };
+            logStore.addError(logId, upstreamError.message);
+            continue;
+          }
           // ponytail: qwenRawChunks stores text content, not raw SSE JSON
           // raw SSE is not stored — qwenRawChunks tracks each content delta
 
@@ -659,7 +698,6 @@ async function handleAnthropicStream(
           }
 
           // Extract local MCP tool calls
-          const deltaStatus = chunk.choices?.[0]?.delta?.status;
           const deltaPhase = chunk.choices?.[0]?.delta?.phase;
           if (deltaStatus === 'finished' && deltaPhase === 'local_tool') {
             const calls = extractLocalMcpToolCalls(chunk);
@@ -677,6 +715,7 @@ async function handleAnthropicStream(
 
           // Handle thinking chunks — emit Anthropic thinking blocks
           if (deltaResult.isThinkingChunk) {
+            reasoningChunkCount++;
             if (reasoningBuffer.length < 20000) reasoningBuffer += deltaResult.vStr;
 
             // Emit message_start if not yet done
@@ -726,6 +765,8 @@ async function handleAnthropicStream(
           }
 
           // ── Text/answer chunks ──────────────────────────────────
+          rawAnswerChunkCount++;
+          if (deltaResult.vStr.trim()) nonEmptyAnswerCount++;
 
           // Emit message_start on first text delta if not already emitted (no thinking)
           if (!emittedMessageStart) {
@@ -908,6 +949,129 @@ async function handleAnthropicStream(
         'chat',
         `[Anthropic] Tool call summary: ${allToolCalls.length} raw → ${validToolCalls.length} valid → emitting ${validToolCalls.length} tool_use blocks`,
       );
+      const anthropicFinalText = (cleanTextOfXmlArtifacts(lastFullContent).cleanedText || '').trim();
+      const terminalError =
+        upstreamError ??
+        (streamAborted
+          ? {
+              code: 'stream_read_error',
+              message: 'Upstream stream ended unexpectedly before completion.',
+            }
+          : null);
+
+      if (validToolCalls.length === 0 && terminalError && anthropicFinalText && isShortContent(anthropicFinalText)) {
+        recordAnomaly(
+          buildAnomalyRecord('short_then_error', {
+            logId,
+            requestId: logId,
+            model: anthropicModel,
+            account: session.accountEmail || resolvedEmail,
+            stream: true,
+            rawAnswerText: lastFullContent,
+            gateFinalText: anthropicFinalText,
+            finalContentLength: anthropicFinalText.length,
+            reasoningLength: reasoningBuffer.length,
+            toolCallCount: validToolCalls.length,
+            rawAnswerChunkCount,
+            nonEmptyAnswerChunkCount: nonEmptyAnswerCount,
+            reasoningChunkCount,
+            hasEmittedContent,
+            upstreamErrorClass: terminalError.code,
+            upstreamErrorAfterContent: true,
+            finishStatus: 'error',
+            streamEOF: !streamAborted,
+            streamTimeout: streamAborted,
+          }),
+        );
+      }
+
+      if (terminalError) {
+        await streamWriter.write(
+          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: terminalError.message, code: terminalError.code } })}\n\n`,
+        );
+        logStore.updateEntry(logId, (entry) => {
+          entry.reasoningContent = reasoningBuffer || undefined;
+          entry.rawFullContent = lastFullContent || reasoningBuffer;
+          entry.processedApiOutput = anthropicFinalText || reasoningBuffer;
+          entry.finalResponse = {
+            finishReason: 'upstream_error',
+            toolCallCount: validToolCalls.length,
+            contentPreview: anthropicFinalText.substring(0, 500),
+          };
+        });
+        streamReleased = true;
+        logStore.finalizeRequest(logId, { finishReason: 'upstream_error' });
+        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+        return;
+      }
+
+      // ── Yes-only detector (observability only — wire behavior unchanged) ──
+      if (validToolCalls.length === 0 && anthropicFinalText && isYesOnly(anthropicFinalText)) {
+        logStore.log('warn', 'chat', `[Anthropic] Yes-only response detected for ${logId} — recording anomaly`);
+        recordAnomaly(
+          buildAnomalyRecord('yes_only', {
+            logId,
+            requestId: logId,
+            model: anthropicModel,
+            account: session.accountEmail || resolvedEmail,
+            stream: true,
+            rawAnswerText: lastFullContent,
+            gateFinalText: anthropicFinalText,
+            finalContentLength: anthropicFinalText.length,
+            reasoningLength: reasoningBuffer.length,
+            toolCallCount: validToolCalls.length,
+            rawAnswerChunkCount,
+            nonEmptyAnswerChunkCount: nonEmptyAnswerCount,
+            reasoningChunkCount,
+            hasEmittedContent,
+            upstreamErrorClass: null,
+            upstreamErrorAfterContent: false,
+            finishStatus: 'end_turn',
+            streamEOF: true,
+            streamTimeout: null,
+          }),
+        );
+      }
+      // ── Zero-output guard (selective port of upstream issue #64) ─────────
+      if (isEmptyOutput({ content: anthropicFinalText, reasoning: reasoningBuffer, toolCallCount: validToolCalls.length })) {
+        const emptyMsg =
+          'Upstream returned empty response with no content, reasoning, or tool calls. Try starting a new conversation or reducing history.';
+        logStore.log('warn', 'chat', `[Anthropic] Empty upstream response for ${logId} (code=${EMPTY_UPSTREAM_CODE})`);
+        logStore.addError(logId, 'Empty upstream response — no content, reasoning, or tool calls');
+        recordAnomaly(
+          buildAnomalyRecord('empty_upstream', {
+            logId,
+            requestId: logId,
+            model: anthropicModel,
+            account: session.accountEmail || resolvedEmail,
+            stream: true,
+            rawAnswerText: lastFullContent,
+            gateFinalText: '',
+            finalContentLength: 0,
+            reasoningLength: reasoningBuffer.length,
+            toolCallCount: validToolCalls.length,
+            rawAnswerChunkCount,
+            nonEmptyAnswerChunkCount: nonEmptyAnswerCount,
+            reasoningChunkCount,
+            hasEmittedContent,
+            upstreamErrorClass: null,
+            upstreamErrorAfterContent: false,
+            finishStatus: EMPTY_UPSTREAM_CODE,
+            streamEOF: true,
+            streamTimeout: false,
+          }),
+        );
+        await streamWriter.write(
+          `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: emptyMsg, code: EMPTY_UPSTREAM_CODE } })}\n\n`,
+        );
+        logStore.updateEntry(logId, (entry) => {
+          entry.finalResponse = { finishReason: EMPTY_UPSTREAM_CODE, toolCallCount: 0, contentPreview: '' };
+        });
+        streamReleased = true;
+        logStore.finalizeRequest(logId, { finishReason: EMPTY_UPSTREAM_CODE });
+        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+        return;
+      }
       // Close text or thinking block
       if (emittedTextBlock) {
         await streamWriter.write(

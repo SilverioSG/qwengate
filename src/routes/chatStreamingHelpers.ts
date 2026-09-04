@@ -123,6 +123,13 @@ export interface StreamProcessingState {
    * text appended to content) vs pre-content (error text is written).
    */
   hasEmittedContent: boolean;
+  /**
+   * Observability counters for anomaly detection (empty/yes-only output).
+   * Additive only — incremented in processStreamData, read at completion.
+   */
+  answerChunkCount?: number;
+  nonEmptyAnswerCount?: number;
+  reasoningChunkCount?: number;
 }
 
 export interface StreamProcessingCtx {
@@ -297,7 +304,14 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   if (!foundStr || vStr === '') return 'continue';
   if (vStr === 'FINISHED') return 'continue';
 
+  // Anomaly observability: count answer-phase deltas (raw, pre-filter).
+  if (!isThinkingChunk) {
+    state.answerChunkCount = (state.answerChunkCount || 0) + 1;
+    if (vStr.trim()) state.nonEmptyAnswerCount = (state.nonEmptyAnswerCount || 0) + 1;
+  }
+
   if (isThinkingChunk) {
+    state.reasoningChunkCount = (state.reasoningChunkCount || 0) + 1;
     if (state.reasoningBuffer.length < 20000) state.reasoningBuffer += vStr;
     // Write thinking content immediately for real-time reasoning_content streaming.
     // Clean XML artifacts to avoid leaking partial tool call syntax into reasoning (the

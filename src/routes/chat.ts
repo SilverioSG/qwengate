@@ -3,8 +3,8 @@ import { Context } from 'hono';
 import { decrementInFlight, decrementModelRequests, incrementModelRequests, pickAccount, throttleAccount } from '../services/auth.ts';
 import { config } from '../services/configService.ts';
 import { logStore } from '../services/logStore.ts';
-import { modelRouter } from '../services/modelRouter.ts';
 import { resolveModelAlias } from '../services/modelAliases.ts';
+import { modelRouter } from '../services/modelRouter.ts';
 import {
   QwenUpstreamError,
   RetryableQwenStreamError,
@@ -182,6 +182,11 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
   // File upload happens inside retry loop using the same account as the request
   // (accounts can't access files uploaded by other accounts — must share the account)
   let lastFailedEmail: string | undefined;
+  // Anomaly observability: track whether a context.txt upload failed on the
+  // attempt that finally serves this request (upload failures otherwise
+  // rotate to the next account; hard-fail behavior is unchanged).
+  let contextFileUsed = false;
+  let contextUploadFailed = false;
 
   const isThinkingModel = thinkingMode !== 'fast';
   const MAX_ACCOUNT_RETRIES = 2;
@@ -228,6 +233,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
       try {
         const file = await uploadLargeTextAsFile(accountEmail, combinedContent, 'context.txt');
         processedMessages[0] = { ...processedMessages[0], files: [file] };
+        contextFileUsed = true;
       } catch (err: any) {
         // NEVER fall back to sending the payload inline: Qwen bot-detects
         // oversized user messages and the request hangs/spins. Retry on the
@@ -237,6 +243,7 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
         if (accountEmail) decrementInFlight(accountEmail);
         lastFailedEmail = accountEmail;
         lastError = err;
+        contextUploadFailed = true;
         continue;
       }
     }
@@ -463,6 +470,13 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
     });
 
     logStore.log('debug', 'chat', `[Chat] Request routed to ${resolvedEmail} — stream ready (attempt ${attempt + 1})`);
+
+    logStore.updateEntry(logId, (entry) => {
+      entry.contextFlags = {
+        contextFileUsed,
+        contextUploadFailed,
+      };
+    });
 
     return {
       sessionMessages,

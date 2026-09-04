@@ -1,5 +1,7 @@
 import { Context } from 'hono';
+import { buildAnomalyRecord, recordAnomaly } from '../services/anomalyLog.ts';
 import { decrementInFlight, pickAccount } from '../services/auth.ts';
+import { EMPTY_UPSTREAM_CODE, isEmptyOutput, isShortContent, isYesOnly } from '../services/emptyOutput.ts';
 import { logStore } from '../services/logStore.ts';
 import { QwenUpstreamError, reportRateLimitWall } from '../services/qwen.ts';
 import { sessionPool } from '../services/sessionPool.ts';
@@ -52,6 +54,10 @@ interface StreamProcessorState {
   upstreamCode?: string;
   upstreamWaitHours?: number;
   upstreamErrorMessage?: string;
+  /** Observability counters for anomaly detection (empty/yes-only output). */
+  answerChunkCount?: number;
+  nonEmptyAnswerCount?: number;
+  reasoningChunkCount?: number;
 }
 
 function buildPromptString(messages: Message[]): string {
@@ -83,6 +89,9 @@ function buildQwenRequest(ctx: NonStreamingContext): StreamProcessorState {
     completionTokens: 0,
     promptTokens: Math.ceil(finalPrompt.length / 3.5),
     nextParentId: ctx.initialParentId,
+    answerChunkCount: 0,
+    nonEmptyAnswerCount: 0,
+    reasoningChunkCount: 0,
   };
 }
 
@@ -102,6 +111,7 @@ function processThinkingDelta(delta: any, state: StreamProcessorState): void {
 
     state.currentThoughtIndex = thoughts.length;
     state.reasoningBuffer += vStr;
+    state.reasoningChunkCount = (state.reasoningChunkCount || 0) + 1;
     return;
   }
 
@@ -110,6 +120,7 @@ function processThinkingDelta(delta: any, state: StreamProcessorState): void {
   if (delta.phase === 'think') {
     if (delta.content !== undefined && delta.content !== '') {
       state.reasoningBuffer += delta.content;
+      state.reasoningChunkCount = (state.reasoningChunkCount || 0) + 1;
     }
     return;
   }
@@ -119,7 +130,8 @@ function processAnswerDelta(delta: any, state: StreamProcessorState, ctx: NonStr
   if (delta.content === undefined) return;
   const vStr = delta.content || '';
   if (!vStr || vStr === 'FINISHED') return;
-
+  state.answerChunkCount = (state.answerChunkCount || 0) + 1;
+  if (vStr.trim()) state.nonEmptyAnswerCount = (state.nonEmptyAnswerCount || 0) + 1;
   logStore.addRawChunk(ctx.logId, vStr);
 
   if (vStr) {
@@ -166,7 +178,9 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
   // Detect upstream Qwen SSE error payload mid-stream
   if (chunk.error) {
     const errMsg = typeof chunk.error === 'string' ? chunk.error : chunk.error.message || JSON.stringify(chunk.error);
-    logStore.addError(ctx.logId, `Qwen upstream SSE error: ${errMsg}`);
+    state.upstreamCode = typeof chunk.error === 'object' && chunk.error.code ? chunk.error.code : 'UpstreamError';
+    state.upstreamErrorMessage = `Qwen upstream SSE error: ${errMsg}`;
+    logStore.addError(ctx.logId, state.upstreamErrorMessage);
     return;
   }
   if (chunk?.success === false) {
@@ -181,7 +195,9 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
   }
   const deltaStatus = chunk.choices?.[0]?.delta?.status;
   if (deltaStatus === 'error') {
-    logStore.addError(ctx.logId, 'Qwen stream delta returned error status');
+    state.upstreamCode = 'UpstreamError';
+    state.upstreamErrorMessage = 'Qwen stream delta returned error status';
+    logStore.addError(ctx.logId, state.upstreamErrorMessage);
     return;
   }
 
@@ -209,7 +225,7 @@ function parseQwenResponse(line: string, state: StreamProcessorState, ctx: NonSt
 
   if (delta.phase === 'think' || delta.phase === 'thinking_summary') {
     processThinkingDelta(delta, state);
-  } else if (delta.phase === 'answer') {
+  } else if (delta.phase === 'answer' || (!delta.phase && delta.content !== undefined)) {
     processAnswerDelta(delta, state, ctx);
   } else if (delta.phase === 'local_tool') {
     // Qwen returns tool calls in the local_tool phase via extra.local_mcp["★"].
@@ -368,18 +384,24 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
   const { c, logId } = ctx;
 
   const parsedError = parseQwenErrorPayload(state.buffer);
-  const errorCode = parsedError?.code ?? state.upstreamCode;
+  const effectiveError =
+    parsedError ??
+    (state.upstreamCode
+      ? {
+          code: state.upstreamCode,
+          waitHours: state.upstreamWaitHours,
+          message: state.upstreamErrorMessage ?? `Qwen upstream error: ${state.upstreamCode}`,
+          status: state.upstreamCode === 'RateLimited' ? 429 : 502,
+        }
+      : null);
+  const errorCode = effectiveError?.code;
   if (errorCode === 'RateLimited') {
-    reportRateLimitWall(ctx.resolvedEmail, ctx.body.model, parsedError?.waitHours ?? state.upstreamWaitHours);
+    reportRateLimitWall(ctx.resolvedEmail, ctx.body.model, effectiveError?.waitHours);
     const alternative = await pickAccount(ctx.resolvedEmail);
     if (alternative) {
       decrementInFlight(alternative.email);
       logStore.log('warn', 'chat', `[Chat] Mid-body RateLimited on ${ctx.resolvedEmail} — rotating account`);
-      throw new QwenUpstreamError(
-        parsedError?.message ?? state.upstreamErrorMessage ?? 'Qwen upstream error: RateLimited',
-        'RateLimited',
-        429,
-      );
+      throw new QwenUpstreamError(effectiveError?.message ?? 'Qwen upstream error: RateLimited', 'RateLimited', 429);
     }
   }
   if (errorCode === 'quota_limit') {
@@ -387,17 +409,110 @@ async function processContentChunks(state: StreamProcessorState, ctx: NonStreami
     if (alternative) {
       decrementInFlight(alternative.email);
       logStore.log('warn', 'chat', `[Chat] Mid-body quota_limit on ${ctx.resolvedEmail} — rotating account`);
-      throw new QwenUpstreamError(
-        parsedError?.message ?? state.upstreamErrorMessage ?? 'Qwen upstream error: quota_limit',
-        'quota_limit',
-        502,
-      );
+      throw new QwenUpstreamError(effectiveError?.message ?? 'Qwen upstream error: quota_limit', 'quota_limit', 502);
     }
   }
-  if (parsedError) {
+  if (effectiveError) {
     logStore.finalizeRequest(logId);
-    const cleanMessage = cleanTextOfXmlArtifacts(parsedError.message).cleanedText || parsedError.message;
-    return c.json({ error: { message: cleanMessage } }, parsedError.status);
+    const cleanMessage = cleanTextOfXmlArtifacts(effectiveError.message).cleanedText || effectiveError.message;
+    // Detector: extremely short content surfaced together with a classified
+    // upstream error — persist structural evidence, keep the error response.
+    const shortCheck = cleanTextOfXmlArtifacts(state.lastFullContent).cleanedText?.trim() || '';
+    if (shortCheck && isShortContent(shortCheck) && state.toolCallsOut.length === 0) {
+      recordAnomaly(
+        buildAnomalyRecord('short_then_error', {
+          logId,
+          requestId: ctx.completionId,
+          model: ctx.body.model,
+          account: ctx.resolvedEmail,
+          stream: false,
+          rawAnswerText: state.lastFullContent,
+          gateFinalText: shortCheck,
+          finalContentLength: shortCheck.length,
+          reasoningLength: state.reasoningBuffer.length,
+          toolCallCount: state.toolCallsOut.length,
+          rawAnswerChunkCount: state.answerChunkCount,
+          nonEmptyAnswerChunkCount: state.nonEmptyAnswerCount,
+          reasoningChunkCount: state.reasoningChunkCount,
+          hasEmittedContent: null,
+          upstreamErrorClass: effectiveError.code ?? null,
+          upstreamErrorAfterContent: true,
+          finishStatus: 'error',
+          streamEOF: true,
+          streamTimeout: false,
+        }),
+      );
+    }
+    return c.json({ error: { message: cleanMessage, code: effectiveError.code } }, <any>effectiveError.status);
+  }
+
+  // ── Yes-only detector (observability only — wire behavior unchanged) ──
+  const filteredCheckPre = cleanTextOfXmlArtifacts(state.lastFullContent).cleanedText?.trim() || '';
+  if (filteredCheckPre && isYesOnly(filteredCheckPre) && state.toolCallsOut.length === 0) {
+    logStore.log('warn', 'chat', `[NonStream] Yes-only response detected for ${logId} — recording anomaly`);
+    recordAnomaly(
+      buildAnomalyRecord('yes_only', {
+        logId,
+        requestId: ctx.completionId,
+        model: ctx.body.model,
+        account: ctx.resolvedEmail,
+        stream: false,
+        rawAnswerText: state.lastFullContent,
+        gateFinalText: filteredCheckPre,
+        finalContentLength: filteredCheckPre.length,
+        reasoningLength: state.reasoningBuffer.length,
+        toolCallCount: state.toolCallsOut.length,
+        rawAnswerChunkCount: state.answerChunkCount,
+        nonEmptyAnswerChunkCount: state.nonEmptyAnswerCount,
+        reasoningChunkCount: state.reasoningChunkCount,
+        hasEmittedContent: null,
+        upstreamErrorClass: state.upstreamCode ?? null,
+        upstreamErrorAfterContent: false,
+        finishStatus: state.toolCallsOut.length > 0 ? 'tool_calls' : 'stop',
+        streamEOF: true,
+        streamTimeout: false,
+      }),
+    );
+  }
+
+  // ── Zero-output guard ───────────────────────────────────────────────
+  // Precedence: RateLimited/quota_limit rotation and classified errors return
+  // above; a set upstreamCode also exempts (classified error wins). Valid tool
+  // calls and valid reasoning/content skip via isEmptyOutput.
+  const reasoningCheck = state.reasoningBuffer?.trim() || '';
+  if (
+    !state.upstreamCode &&
+    isEmptyOutput({ content: filteredCheckPre, reasoning: reasoningCheck, toolCallCount: state.toolCallsOut.length })
+  ) {
+    const emptyMsg =
+      'Upstream returned empty response with no content, reasoning, or tool calls. Try starting a new conversation or reducing history.';
+    logStore.log('warn', 'chat', `[NonStream] Empty upstream response for ${logId} (code=${EMPTY_UPSTREAM_CODE})`);
+    logStore.addError(logId, 'Empty upstream response — no content, reasoning, or tool calls');
+    recordAnomaly(
+      buildAnomalyRecord('empty_upstream', {
+        logId,
+        requestId: ctx.completionId,
+        model: ctx.body.model,
+        account: ctx.resolvedEmail,
+        stream: false,
+        rawAnswerText: state.lastFullContent,
+        gateFinalText: '',
+        finalContentLength: 0,
+        reasoningLength: reasoningCheck.length,
+        toolCallCount: state.toolCallsOut.length,
+        rawAnswerChunkCount: state.answerChunkCount,
+        nonEmptyAnswerChunkCount: state.nonEmptyAnswerCount,
+        reasoningChunkCount: state.reasoningChunkCount,
+        hasEmittedContent: null,
+        upstreamErrorClass: state.upstreamCode ?? null,
+        upstreamErrorAfterContent: false,
+        finishStatus: EMPTY_UPSTREAM_CODE,
+        streamEOF: true,
+        streamTimeout: false,
+      }),
+    );
+    logStore.finalizeRequest(logId);
+    return c.json({ error: { message: emptyMsg, type: 'server_error', code: EMPTY_UPSTREAM_CODE } }, 502);
   }
 
   flushAndDetectLoops(state, logId);

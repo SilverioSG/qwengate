@@ -89,6 +89,11 @@ export interface LogEntry {
   amplificationRatio?: number;
   amplificationTriggeredInput?: string;
   apiType?: 'openai' | 'anthropic';
+  /** Context-file routing flags for anomaly observability (set in setupSession). */
+  contextFlags?: {
+    contextFileUsed: boolean;
+    contextUploadFailed: boolean;
+  };
 }
 const MAX_CHUNKS_PER_ENTRY = 100;
 const MAX_FIELD_LENGTH = 10240;
