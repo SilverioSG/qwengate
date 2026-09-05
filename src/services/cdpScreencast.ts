@@ -21,6 +21,8 @@ export interface ScreencastSession {
   viewportHeight: number;
   pageId: string | null;
   closed: boolean;
+  loginCompleted: boolean;
+  loginCompletionInFlight: boolean;
   loginCheckInterval: ReturnType<typeof setInterval> | null;
 }
 
@@ -150,6 +152,8 @@ export async function startScreencast(
     viewportHeight: 800,
     pageId: null,
     closed: false,
+    loginCompleted: false,
+    loginCompletionInFlight: false,
     loginCheckInterval: null,
   };
   sessions.set(email, session);
@@ -344,9 +348,7 @@ async function connectCDP(session: ScreencastSession, wsUrl: string): Promise<vo
         const url = msg.params?.frame?.url || '';
         // Skip initial about:blank and about:srcdoc — only detect post-auth navigations
         if (url && !url.startsWith('about:') && url.includes('chat.qwen.ai') && !url.includes('/auth')) {
-          logStore.log('info', 'screencast', `Login complete for ${session.email} — navigated to ${url}`);
-          broadcastToClients(session, JSON.stringify({ type: 'login_complete' }));
-          setTimeout(() => cleanupSession(session.email), 2000);
+          logStore.log('info', 'screencast', `Post-login navigation detected for ${session.email}: ${url}`);
         }
       }
     });
@@ -364,7 +366,13 @@ async function connectCDP(session: ScreencastSession, wsUrl: string): Promise<vo
 
 function startLoginPolling(session: ScreencastSession): void {
   session.loginCheckInterval = setInterval(async () => {
-    if (session.closed || !session.cdpWs || session.cdpWs.readyState !== WebSocket.OPEN) {
+    if (
+      session.closed ||
+      session.loginCompleted ||
+      session.loginCompletionInFlight ||
+      !session.cdpWs ||
+      session.cdpWs.readyState !== WebSocket.OPEN
+    ) {
       if (session.loginCheckInterval) clearInterval(session.loginCheckInterval);
       return;
     }
@@ -372,12 +380,20 @@ function startLoginPolling(session: ScreencastSession): void {
     try {
       const result = await cdpSend(session, 'Network.getCookies', { urls: ['https://chat.qwen.ai'] });
       const tokenCookie = result?.cookies?.find((c: any) => c.name === 'token');
-      if (tokenCookie && tokenCookie.expires && tokenCookie.expires * 1000 > Date.now()) {
+      if (
+        !session.loginCompleted &&
+        !session.loginCompletionInFlight &&
+        tokenCookie &&
+        tokenCookie.expires &&
+        tokenCookie.expires * 1000 > Date.now()
+      ) {
         logStore.log('info', 'screencast', `Token found for ${session.email} — login successful`);
+        session.loginCompletionInFlight = true;
         const { saveCookies } = await import('./auth.ts');
         const refreshCookie = result.cookies.find((c: any) => c.name.toLowerCase().includes('refresh'));
         await saveCookies(session.email, tokenCookie.value, refreshCookie?.value);
 
+        session.loginCompleted = true;
         broadcastToClients(session, JSON.stringify({ type: 'login_complete' }));
         setTimeout(() => cleanupSession(session.email), 2000);
       }
