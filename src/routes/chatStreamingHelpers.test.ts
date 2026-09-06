@@ -699,3 +699,54 @@ test('parseQwenErrorPayload without code stays compatible', async () => {
   assert.strictEqual(parsed.code, undefined, 'absent code must stay undefined');
   assert.strictEqual(parsed.message, 'Qwen upstream error: boom');
 });
+
+// ── FAIL_SYS_USER_VALIDATE first-chunk CAPTCHA detection ──
+
+test('parseQwenErrorPayload detects FAIL_SYS_USER_VALIDATE with details', async () => {
+  const { parseQwenErrorPayload } = await import('./chatHelpersCore.ts');
+
+  const parsed = parseQwenErrorPayload('{"ret":["FAIL_SYS_USER_VALIDATE","CAPTCHA required"]}');
+
+  assert.ok(parsed, 'must parse ret envelope');
+  assert.strictEqual(parsed.code, 'FAIL_SYS_USER_VALIDATE', 'code must be preserved for routing');
+  assert.strictEqual(parsed.status, 502);
+  assert.ok(parsed.message.includes('FAIL_SYS_USER_VALIDATE'), 'message must include code');
+  assert.ok(parsed.message.includes('CAPTCHA required'), 'message must include details');
+});
+
+test('parseQwenErrorPayload detects FAIL_SYS_USER_VALIDATE without details', async () => {
+  const { parseQwenErrorPayload } = await import('./chatHelpersCore.ts');
+
+  const parsed = parseQwenErrorPayload('{"ret":["FAIL_SYS_USER_VALIDATE"]}');
+
+  assert.ok(parsed, 'must parse ret envelope without second element');
+  assert.strictEqual(parsed.code, 'FAIL_SYS_USER_VALIDATE');
+  assert.strictEqual(parsed.status, 502);
+  assert.ok(parsed.message.includes('CAPTCHA required'), 'fallback details must be used');
+});
+
+test('parseQwenErrorPayload detects FAIL_SYS_USER_VALIDATE in SSE data: frame', async () => {
+  const { parseQwenErrorPayload } = await import('./chatHelpersCore.ts');
+
+  const parsed = parseQwenErrorPayload('data: {"ret":["FAIL_SYS_USER_VALIDATE","verify"]}');
+
+  assert.ok(parsed, 'must strip SSE prefix and parse');
+  assert.strictEqual(parsed.code, 'FAIL_SYS_USER_VALIDATE');
+  assert.ok(parsed.message.includes('verify'));
+});
+
+test('parseQwenErrorPayload ignores unrelated ret arrays', async () => {
+  const { parseQwenErrorPayload } = await import('./chatHelpersCore.ts');
+
+  const parsed = parseQwenErrorPayload('{"ret":["SUCCESS","ok"]}');
+
+  assert.strictEqual(parsed, null, 'non-CAPTCHA ret must not trigger error parsing');
+});
+
+test('parseQwenErrorPayload ignores empty ret array', async () => {
+  const { parseQwenErrorPayload } = await import('./chatHelpersCore.ts');
+
+  const parsed = parseQwenErrorPayload('{"ret":[]}');
+
+  assert.strictEqual(parsed, null, 'empty ret must return null');
+});

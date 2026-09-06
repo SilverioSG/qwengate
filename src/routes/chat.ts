@@ -418,6 +418,24 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
           'chat',
           `[Chat] Pre-emission quota_limit on ${resolvedEmail} (${routedModel}) — no alternative account available`,
         );
+      } else if (wall?.code === 'FAIL_SYS_USER_VALIDATE') {
+        throttleAccount(resolvedEmail, 5 * 60 * 1000);
+        const alternative = await pickAccount(resolvedEmail);
+        if (alternative) {
+          decrementInFlight(alternative.email);
+          logStore.log('warn', 'chat', `[Chat] First-chunk CAPTCHA on ${resolvedEmail} (${routedModel}) — throttled 5min, rotating account`);
+          streamReader.cancel().catch(() => {});
+          qwenAbortController?.abort();
+          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+          lastFailedEmail = resolvedEmail;
+          lastError = new RetryableQwenStreamError(wall.message, 3000);
+          continue;
+        }
+        logStore.log(
+          'warn',
+          'chat',
+          `[Chat] First-chunk CAPTCHA on ${resolvedEmail} (${routedModel}) — no alternative account available`,
+        );
       } else if (wall) {
         // Other upstream errors (internal_error, etc.) in first chunk — rotate pre-content
         logStore.log('warn', 'chat', `[Chat] First-chunk upstream error on ${resolvedEmail}: ${wall.code} — rotating account`);

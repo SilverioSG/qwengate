@@ -249,6 +249,10 @@ export function parseQwenErrorPayload(raw: string): {
           : undefined;
       return { message: `Qwen upstream error: ${msg}`, status: 502, code };
     }
+    if (payload && Array.isArray(payload.ret) && payload.ret[0] === 'FAIL_SYS_USER_VALIDATE') {
+      const details = payload.ret[1] || 'CAPTCHA required';
+      return { message: `Qwen CAPTCHA — FAIL_SYS_USER_VALIDATE: ${details}`, status: 502, code: 'FAIL_SYS_USER_VALIDATE' };
+    }
   } catch {
     return null;
   }
