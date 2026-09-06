@@ -1426,6 +1426,7 @@ test('Model alias: /v1/models returns aliases inheriting base model metadata', a
 // inFlight balance tests
 // ═══════════════════════════════════════════════════════════════════════════
 
+import { getRetryablePreEmissionQuota, MAX_MIDSTREAM_QUOTA_HANDOFFS } from '../routes/streamLoop.ts';
 import {
   decrementInFlight,
   decrementModelRequests,
@@ -1903,4 +1904,326 @@ test('SSE data.error quota_limit on all accounts: max 1 handoff then terminal er
     rebuildEmailIndex();
     globalThis.fetch = originalFetch;
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Mid-stream pre-emission quota_limit handoff
+// Pattern: chunk1 healthy (response.created, no content) + chunk2 quota_limit
+// with hasEmittedContent=false → exactly 1 handoff A→B.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const MID_HEALTHY_FIRST = 'data: {"response.created":{"chat_id":"c1","parent_id":"p1","response_id":"r1","response_index":"0"}}\n\n';
+const MID_HEALTHY_FIRST_B = 'data: {"response.created":{"chat_id":"c2","parent_id":"p2","response_id":"r2","response_index":"0"}}\n\n';
+const MID_QUOTA_CHUNK =
+  'data: {"error":{"code":"quota_limit","details":"The service is currently experiencing high demand. Please try again later."}}\n\n';
+const MID_DONE = 'data: [DONE]\n\n';
+// NOTE: answer chunks must carry the matching response_id, like real Qwen SSE.
+// Without it, extractDeltaContent drops the delta once response.created set
+// the target response id (id-less chunks only pass when no created arrived).
+const midAnswer = (text: string, rid: string) =>
+  `data: {"response_id":"${rid}","choices":[{"delta":{"phase":"answer","content":"${text}"}}]}\n\n`;
+
+function midSseResponse(lines: string[]): Response {
+  const stream = new ReadableStream({
+    start(c) {
+      for (const line of lines) c.enqueue(new TextEncoder().encode(line));
+      c.close();
+    },
+  });
+  return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+}
+
+async function readMidSse(res: Response): Promise<string> {
+  const reader = res.body?.getReader();
+  assert.ok(reader, 'Response should have a readable body');
+  const decoder = new TextDecoder();
+  let out = '';
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    out += decoder.decode(value, { stream: true });
+  }
+  return out;
+}
+
+function mockMidChat(handler: (callIndex: number) => Response): { restore: () => void; calls: () => number } {
+  const originalFetch = globalThis.fetch;
+  let chatCalls = 0;
+  (globalThis as any).fetch = async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      chatCalls++;
+      return handler(chatCalls);
+    }
+    return (originalFetch as any)(input, init);
+  };
+  return {
+    restore: () => {
+      globalThis.fetch = originalFetch;
+    },
+    calls: () => chatCalls,
+  };
+}
+
+function pushMidAccts(...emails: string[]): Array<any> {
+  const originalAccounts = [...accounts];
+  for (const email of emails) accounts.push(makeAcct(email));
+  rebuildEmailIndex();
+  return originalAccounts;
+}
+
+function restoreMidAccts(originalAccounts: Array<any>): void {
+  accounts.length = 0;
+  accounts.push(...originalAccounts);
+  rebuildEmailIndex();
+}
+
+function midChatRequest(): Request {
+  return new Request('http://localhost/v1/chat/completions', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+    body: JSON.stringify({ model: 'qwen3.6-plus', messages: [{ role: 'user', content: 'hello' }], stream: true }),
+  });
+}
+
+// Session release runs on setTimeout(0); let a finished test's timers fire
+// before the next test installs spies, so releases never leak across tests.
+function settleMidReleases(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 50));
+}
+
+// B. chunk1 healthy + chunk2 quota_limit, nothing emitted → handoff A→B, B success, no visible error.
+test('MID-STREAM B: healthy first chunk + quota_limit with no content → handoff A→B, client sees B only', async () => {
+  const originalAccounts = pushMidAccts('ql-mid-b1@test.dev', 'ql-mid-b2@test.dev');
+  const mock = mockMidChat((call) =>
+    call === 1
+      ? midSseResponse([MID_HEALTHY_FIRST, MID_QUOTA_CHUNK, MID_DONE])
+      : midSseResponse([MID_HEALTHY_FIRST_B, midAnswer('Hello from B', 'r2'), MID_DONE]),
+  );
+
+  try {
+    const res = await app.fetch(midChatRequest());
+    assert.strictEqual(res.status, 200, `Expected 200 after handoff, got ${res.status}`);
+    // Drain the client stream FIRST: the mid-stream handoff runs while the
+    // stream is consumed — asserting counts before EOF races the background
+    // rotation (and can leak it into the next test's mock).
+    const allSseB = await readMidSse(res);
+    assert.strictEqual(mock.calls(), 2, `Expected exactly 2 upstream calls (1 handoff), got ${mock.calls()}`);
+
+    const allSse = allSseB;
+    assert.ok(allSse.includes('Hello from B'), 'Client must see B content');
+    assert.ok(!allSse.includes('[Error]'), 'No [Error] must reach the client after successful handoff');
+    assert.ok(!allSse.includes('quota_limit'), 'Quota envelope must not leak to the client');
+    assert.strictEqual(allSse.split('Hello from B').length - 1, 1, 'B content must appear exactly once (no duplication)');
+
+    // G (partial): quota path must not throttle — A stays eligible.
+    const acctA = accounts.find((a) => a.email === 'ql-mid-b1@test.dev');
+    assert.ok(acctA, 'acctA should exist');
+    assert.ok(!acctA?.throttledUntil || acctA.throttledUntil <= Date.now(), 'quota_limit must NOT throttle A');
+    await settleMidReleases();
+  } finally {
+    mock.restore();
+    restoreMidAccts(originalAccounts);
+  }
+});
+
+// C2. tool_call emitted + quota_limit after → NO handoff (post-emission by emission flag).
+test('MID-STREAM C: tool_call emitted before quota_limit → no handoff', async () => {
+  const originalAccounts = pushMidAccts('ql-mid-c1@test.dev', 'ql-mid-c2@test.dev');
+  const toolChunk =
+    'data: {"choices":[{"delta":{"phase":"local_tool","status":"finished","extra":{"local_mcp":{"Srv":[{"tool_name":"Srv-bash","params":{"command":"ls"}}]}}}}]}\n\n';
+  const mock = mockMidChat(() => midSseResponse([toolChunk, MID_QUOTA_CHUNK, MID_DONE]));
+
+  try {
+    const res = await app.fetch(midChatRequest());
+    assert.strictEqual(res.status, 200);
+    const allSseC = await readMidSse(res);
+    assert.strictEqual(mock.calls(), 1, `Emitted tool_call forbids handoff (expected 1 call, got ${mock.calls()})`);
+
+    const allSse = allSseC;
+    assert.ok(allSse.includes('bash'), 'Emitted tool call must stay visible');
+    assert.ok(!allSse.includes('[Error]'), 'Post-emission error must not append [Error] text');
+    await settleMidReleases();
+  } finally {
+    mock.restore();
+    restoreMidAccts(originalAccounts);
+  }
+});
+
+// D. pre-emission quota + no alternative → controlled visible error, no loop.
+// NOTE: in TEST_MOCK_PLAYWRIGHT the session reports accountEmail='mock@test'
+// instead of the picked account, so the exclude-probe cannot filter the single
+// test account (production excludes the real failed account and stops at 1
+// call). Either way the contract holds: terminal error, no third upstream call.
+test('MID-STREAM D: quota_limit with single account → terminal error, no retry loop', async () => {
+  const originalAccounts = pushMidAccts('ql-mid-d1@test.dev');
+  const mock = mockMidChat(() => midSseResponse([MID_HEALTHY_FIRST, MID_QUOTA_CHUNK, MID_DONE]));
+
+  try {
+    const res = await app.fetch(midChatRequest());
+    assert.strictEqual(res.status, 200);
+    const allSseD = await readMidSse(res);
+    assert.ok(mock.calls() <= 2, `No loop → at most 2 upstream calls, got ${mock.calls()}`);
+
+    const allSse = allSseD;
+    assert.ok(allSse.includes('[Error]'), 'Terminal pre-emission error must be visible');
+    assert.ok(allSse.includes('quota_limit'), 'Terminal error must carry the semantic code');
+    await settleMidReleases();
+  } finally {
+    mock.restore();
+    restoreMidAccts(originalAccounts);
+  }
+});
+
+// E. A quota → B quota → no third attempt (MAX_HANDOFFS_PER_REQUEST=1).
+test('MID-STREAM E: quota on A and B → terminal error after exactly 1 handoff', async () => {
+  assert.strictEqual(MAX_MIDSTREAM_QUOTA_HANDOFFS, 1, 'Contract: MAX_HANDOFFS_PER_REQUEST=1');
+  const originalAccounts = pushMidAccts('ql-mid-e1@test.dev', 'ql-mid-e2@test.dev');
+  const mock = mockMidChat(() => midSseResponse([MID_HEALTHY_FIRST, MID_QUOTA_CHUNK, MID_DONE]));
+
+  try {
+    const res = await app.fetch(midChatRequest());
+    assert.strictEqual(res.status, 200);
+    const allSseE = await readMidSse(res);
+    assert.strictEqual(mock.calls(), 2, `Max 1 handoff → exactly 2 upstream calls, got ${mock.calls()}`);
+
+    const allSse = allSseE;
+    assert.ok(allSse.includes('[Error]'), 'Exhausted handoff must surface a controlled error');
+    await settleMidReleases();
+  } finally {
+    mock.restore();
+    restoreMidAccts(originalAccounts);
+  }
+});
+
+// F. inFlight accounting + single release per session on the handoff path.
+test('MID-STREAM F: handoff releases A once and B once, probe pick stays balanced', async () => {
+  const originalAccounts = pushMidAccts('ql-mid-f1@test.dev', 'ql-mid-f2@test.dev');
+  const mock = mockMidChat((call) =>
+    call === 1
+      ? midSseResponse([MID_HEALTHY_FIRST, MID_QUOTA_CHUNK, MID_DONE])
+      : midSseResponse([MID_HEALTHY_FIRST_B, midAnswer('Hello from B', 'r2'), MID_DONE]),
+  );
+  const origRelease = sessionPool.release.bind(sessionPool);
+  const releases: Array<{ chatId: string; isSuccess: boolean }> = [];
+  (sessionPool as any).release = (chatId: string, parentId: string | null, headers: any, email: string, isSuccess = true) => {
+    releases.push({ chatId, isSuccess });
+    return origRelease(chatId, parentId, headers, email, isSuccess);
+  };
+
+  try {
+    const res = await app.fetch(midChatRequest());
+    assert.strictEqual(res.status, 200);
+    await readMidSse(res); // drain: handoff + releases settle with the consumed stream
+    await new Promise((r) => setTimeout(r, 50)); // flush scheduleCleanup(0) releases
+
+    assert.strictEqual(mock.calls(), 2, 'Handoff path performs 2 upstream calls');
+    assert.strictEqual(releases.length, 2, `Each session released exactly once, got ${releases.length}`);
+    assert.ok(releases.some((r) => r.isSuccess === false), 'Failed attempt A released as failure');
+    assert.ok(releases.some((r) => r.isSuccess === true), 'Successful attempt B released as success');
+
+    // Mock sessions are not tracked by the pool (TEST_MOCK_PLAYWRIGHT), so the
+    // pool release no-ops on counters here; production decrements via the real
+    // release above. Balance check: exactly one setupSession pick per attempt
+    // (probe pick is released immediately) → total inFlight across both = 2.
+    const total = accounts.filter((a) => a.email.startsWith('ql-mid-f')).reduce((sum, a) => sum + (a.inFlight || 0), 0);
+    assert.strictEqual(total, 2, `Probe pick must stay balanced (expected total inFlight 2, got ${total})`);
+  } finally {
+    (sessionPool as any).release = origRelease;
+    mock.restore();
+    restoreMidAccts(originalAccounts);
+  }
+});
+
+// G. semantic code preserved by the mid-stream detector (both envelope shapes).
+test('MID-STREAM G: detector preserves quota_limit code, rejects post-emission and foreign codes', async () => {
+  const baseState = (over: Record<string, unknown>) =>
+    ({
+      targetResponseId: null,
+      nextParentId: null,
+      completionTokens: 0,
+      promptTokens: 0,
+      currentThoughtIndex: 0,
+      reasoningBuffer: '',
+      lastFullContent: '',
+      lastRawContent: '',
+      lastFilteredSnapshot: '',
+      lastThinkingSnapshot: '',
+      lastVStrRaw: '',
+      lastFilteredFullContent: '',
+      lastDeltaThinkingFull: '',
+      loggedToolCalls: new Set<string>(),
+      lastParsePosition: 0,
+      toolCallDepth: 0,
+      pendingChunk: '',
+      hasEmittedContent: false,
+      ...over,
+    }) as any;
+
+  // State shape (processStreamData path): code stashed on state, empty buffer tail.
+  const viaState = getRetryablePreEmissionQuota({
+    streamState: baseState({ upstreamError: 'Qwen upstream error: quota_limit', upstreamCode: 'quota_limit' }),
+    emittedToolCallCount: 0,
+    buffer: '',
+  });
+  assert.ok(viaState, 'State-carried quota_limit must be retryable');
+  assert.strictEqual(viaState?.code, 'quota_limit', 'SEMANTIC_CODE must stay quota_limit');
+
+  // Buffer shape (late envelope in trailing partial line).
+  const viaBuffer = getRetryablePreEmissionQuota({
+    streamState: baseState({}),
+    emittedToolCallCount: 0,
+    buffer: 'data: {"error":{"code":"quota_limit","details":"busy"}}\n\n',
+  });
+  assert.ok(viaBuffer, 'Buffer-carried quota_limit must be retryable');
+  assert.strictEqual(viaBuffer?.code, 'quota_limit');
+
+  // RateLimited equivalent is eligible too (first-chunk/mid-body parity).
+  const rateLimited = getRetryablePreEmissionQuota({
+    streamState: baseState({ upstreamError: 'Qwen upstream error: RateLimited', upstreamCode: 'RateLimited' }),
+    emittedToolCallCount: 0,
+    buffer: '',
+  });
+  assert.ok(rateLimited, 'RateLimited must be eligible like quota_limit');
+  assert.strictEqual(rateLimited?.code, 'RateLimited');
+
+  // Post-emission is forbidden.
+  assert.strictEqual(
+    getRetryablePreEmissionQuota({
+      streamState: baseState({
+        upstreamError: 'Qwen upstream error: quota_limit',
+        upstreamCode: 'quota_limit',
+        hasEmittedContent: true,
+      }),
+      emittedToolCallCount: 0,
+      buffer: '',
+    }),
+    null,
+    'Post-emission quota must NOT be retryable',
+  );
+
+  // Emitted tool calls forbid handoff even with hasEmittedContent unset.
+  assert.strictEqual(
+    getRetryablePreEmissionQuota({
+      streamState: baseState({ upstreamError: 'Qwen upstream error: quota_limit', upstreamCode: 'quota_limit' }),
+      emittedToolCallCount: 1,
+      buffer: '',
+    }),
+    null,
+    'Emitted tool calls must forbid handoff',
+  );
+
+  // Foreign codes are untouched.
+  assert.strictEqual(
+    getRetryablePreEmissionQuota({
+      streamState: baseState({ upstreamError: 'Qwen upstream error: internal_error', upstreamCode: 'internal_error' }),
+      emittedToolCallCount: 0,
+      buffer: '',
+    }),
+    null,
+    'Non-quota codes must not trigger handoff',
+  );
 });

@@ -106,7 +106,14 @@ async function parseRequestBody(c: Context) {
   };
 }
 
-async function setupSession(messages: any[], body: OpenAIRequest, availableTokens: number, toolCalling: boolean, logId: string) {
+async function setupSession(
+  messages: any[],
+  body: OpenAIRequest,
+  availableTokens: number,
+  toolCalling: boolean,
+  logId: string,
+  initialExcludeEmail?: string,
+) {
   // ── Image detection ──────────────────────────────────────────
   // Only scan the LAST message — previous turns already uploaded their images
   let hasImages = false;
@@ -181,7 +188,9 @@ async function setupSession(messages: any[], body: OpenAIRequest, availableToken
 
   // File upload happens inside retry loop using the same account as the request
   // (accounts can't access files uploaded by other accounts — must share the account)
-  let lastFailedEmail: string | undefined;
+  // initialExcludeEmail seeds the mid-stream pre-emission handoff: the failed
+  // account is never re-picked for the replacement attempt.
+  let lastFailedEmail: string | undefined = initialExcludeEmail;
   // Anomaly observability: track whether a context.txt upload failed on the
   // attempt that finally serves this request (upload failures otherwise
   // rotate to the next account; hard-fail behavior is unchanged).
@@ -626,6 +635,28 @@ export async function chatCompletions(c: Context) {
       sessionHeaders,
       toolCalling,
       cleanOutput,
+      acquireNextSession: async (excludeEmail: string) => {
+        // Eligibility probe first: no alternative → null (controlled terminal
+        // error, no loop). The probe pick is immediately released so counters
+        // stay balanced; setupSession below performs the real pick.
+        const probe = await pickAccount(excludeEmail);
+        if (!probe) return null;
+        decrementInFlight(probe.email);
+        try {
+          const retry = await setupSession(messages, body, contextCheck.availableTokens!, toolCalling, logId, excludeEmail);
+          return {
+            session: retry.session,
+            nextParentId: retry.nextParentId,
+            sessionHeaders: retry.sessionHeaders,
+            resolvedEmail: retry.resolvedEmail,
+            stream: retry.stream,
+            qwenAbortController: retry.qwenAbortController,
+            qwenLogFile: undefined,
+          };
+        } catch {
+          return null;
+        }
+      },
     });
   } catch (err: any) {
     console.error(`[Chat] <<< Request failed after ${Date.now() - _requestStartTime}ms: ${err?.message || err}`);

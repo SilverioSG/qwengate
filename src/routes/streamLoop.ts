@@ -12,6 +12,52 @@ import { buildChunkEvent, buildUsage, makeChoice, writeEvent, writeReasoningEven
 /** Shared TextDecoder — stateless, safe to reuse across streams */
 export const sharedDecoder = new TextDecoder();
 
+/**
+ * Mid-stream pre-emission quota handoff budget.
+ * A single client request may rotate accounts at most once after the stream
+ * started: first-chunk rotations (setupSession) and mid-stream pre-emission
+ * rotations share no counter — this cap applies only to the mid-stream path,
+ * where the client stream is already open and every extra attempt delays it.
+ */
+export const MAX_MIDSTREAM_QUOTA_HANDOFFS = 1;
+
+/** Upstream codes eligible for mid-stream pre-emission handoff (mirrors first-chunk/mid-body rules). */
+const MIDSTREAM_HANDOFF_CODES = new Set(['quota_limit', 'RateLimited']);
+
+export interface RetryablePreEmissionQuota {
+  code: string;
+  message: string;
+  waitHours?: number;
+}
+
+/**
+ * Detect a retryable mid-stream pre-emission quota error.
+ *
+ * Returns non-null ONLY when ALL hold:
+ * - the failure carries quota_limit (or equivalent RateLimited) semantic code,
+ *   from either the trailing buffer or the accumulated stream state;
+ * - no content/reasoning/tool_call was emitted to the client yet;
+ * - no tool calls were emitted (emittedToolCallCount === 0).
+ *
+ * Post-emission failures (hasEmittedContent) return null: handoff is forbidden
+ * there to never mix streams from different accounts.
+ */
+export function getRetryablePreEmissionQuota(args: {
+  streamState: StreamProcessingState;
+  emittedToolCallCount: number;
+  buffer: string;
+}): RetryablePreEmissionQuota | null {
+  const parsedError = parseQwenErrorPayload(args.buffer);
+  const upstreamCode = parsedError?.code ?? args.streamState.upstreamCode;
+  if (!upstreamCode || !MIDSTREAM_HANDOFF_CODES.has(upstreamCode)) return null;
+  const hasError = parsedError || args.streamState.upstreamError;
+  if (!hasError) return null;
+  if (args.streamState.hasEmittedContent) return null;
+  if (args.emittedToolCallCount > 0) return null;
+  const message = parsedError?.message ?? args.streamState.upstreamError ?? `Qwen upstream error: ${upstreamCode}`;
+  return { code: upstreamCode, message, waitHours: parsedError?.waitHours ?? args.streamState.upstreamWaitHours };
+}
+
 export interface StreamLoopResult {
   buffer: string;
   nextParentId: string | null;

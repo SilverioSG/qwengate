@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Mid-Stream Pre-Emission Quota Handoff**: when upstream sends `quota_limit` (or equivalent `RateLimited`) after a healthy first chunk but before any content/reasoning/tool_call was emitted, and another account is eligible, the gateway now releases the failed session and retries once on a fresh account/session instead of surfacing the error. Max 1 handoff per request. Post-emission behavior unchanged (account streams are never mixed). First-chunk handling, SessionPool, throttling, idle timeout, CAPTCHA, and semantic-code parsing unchanged. See `docs/quota-midstream-preemission-handoff.md`.
+
 ## [0.7.2] - 2026-06-23
 
 ### Fixed
