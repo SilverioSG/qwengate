@@ -61,3 +61,17 @@ Handoff A→B pre-emission mid-stream, máximo 1 handoff/request
 - NEW_REGRESSIONS=0
 - LIVE_NATURAL_QUOTA_VALIDATION=PENDING (sin quota natural en la ventana;
   no se forzó)
+
+## FINAL CLOSURE
+
+- INCIDENT=quota_limit PRE-EMISSION MID-STREAM → CLOSED
+- FIX_COMMIT=5f7cb1cc6774e25c208d63967e010a84fa824dc3
+- TEST_VALIDATION=PASS (277/277, tsc, diff-check)
+- RUNTIME_VALIDATION=PASS (smoke + agentic 3×tool/3×result grounded)
+- REMOTE_PUSH=PASS, HEAD_EQUALS_ORIGIN_MAIN=YES
+- DASHBOARD_BASELINE_RESET=PASS (monitor/usage reseteados con backup
+  preservado; smoke post-reset 200/stop, 1 request / 0 errores)
+- LIVE_NATURAL_QUOTA_VALIDATION=PASSIVE_MONITORING (no blocker):
+  el próximo quota_limit natural debe confirmar
+  ERROR_PHASE=MIDSTREAM_PREEMISSION, HANDOFF_ATTEMPTED=YES,
+  HANDOFF_SUCCESS=YES, ERROR_PROPAGATED_TO_CLIENT=NO.
