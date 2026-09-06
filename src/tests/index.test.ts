@@ -1710,3 +1710,197 @@ test('quota_limit does NOT throttle the account', async () => {
     rebuildEmailIndex();
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+// data.error quota_limit failover tests (2026-09-06 incident envelope)
+// Upstream sends: data: {"error":{"code":"quota_limit","details":"..."}}
+// ═══════════════════════════════════════════════════════════════════════════
+
+const DATA_ERROR_QUOTA_LINE =
+  'data: {"error":{"code":"quota_limit","details":"The service is currently experiencing high demand. Please try again later."}}\n\n';
+
+test('SSE pre-content data.error quota_limit: handoff to second account', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push(makeAcct('ql-de-pre1@test.dev'));
+  accounts.push(makeAcct('ql-de-pre2@test.dev'));
+  rebuildEmailIndex();
+
+  let chatCalls = 0;
+  (globalThis as any).fetch = async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      chatCalls++;
+      // First call returns the exact incident envelope as first SSE chunk
+      if (chatCalls === 1) {
+        return new Response(DATA_ERROR_QUOTA_LINE, {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        });
+      }
+      // Second call: return valid SSE stream
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"Hello from acct2"}}]}\n\n'));
+          controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify({
+        model: 'qwen3.6-plus',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    // FAILOVER_ATTEMPTED=YES: handoff must have happened (initial + 1 handoff, max 1)
+    assert.ok(res.status === 200, `Expected 200 after handoff, got ${res.status}`);
+    assert.strictEqual(chatCalls, 2, `Expected exactly 2 chat calls (HANDOFF_COUNT=1), got ${chatCalls}`);
+
+    // ERROR_NOT_PROPAGATED_ON_SUCCESSFUL_HANDOFF=YES: client sees content, not [Error]
+    const allSse = await res.text();
+    assert.ok(allSse.includes('Hello from acct2'), 'Should contain second-account content');
+    assert.ok(!allSse.includes('[Error]'), 'Should NOT propagate [Error] after successful handoff');
+
+    // The account that hit quota_limit should NOT be throttled
+    const acct1 = accounts.find(a => a.email === 'ql-de-pre1@test.dev');
+    assert.ok(acct1, 'acct1 should exist');
+    assert.ok(!acct1?.throttledUntil || acct1.throttledUntil <= Date.now(), 'acct1 should NOT be throttled');
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('SSE post-content data.error quota_limit: NO handoff, partial content preserved', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push(makeAcct('ql-de-post1@test.dev'));
+  accounts.push(makeAcct('ql-de-post2@test.dev'));
+  rebuildEmailIndex();
+
+  let chatCalls = 0;
+  (globalThis as any).fetch = async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      chatCalls++;
+      // Content first (passes first-chunk check), then data.error quota_limit
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"phase":"answer","content":"Hello world"}}]}\n\n'));
+          c.enqueue(
+            new TextEncoder().encode(
+              'data: {"error":{"code":"quota_limit","details":"The service is currently experiencing high demand. Please try again later."}}\n\n',
+            ),
+          );
+          c.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+          c.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify({
+        model: 'qwen3.6-plus',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 200);
+
+    const reader = res.body?.getReader();
+    assert.ok(reader, 'Response should have a readable body');
+    const decoder = new TextDecoder();
+    let allSse = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      allSse += decoder.decode(value, { stream: true });
+    }
+
+    assert.ok(allSse.includes('Hello world'), 'Should contain partial content "Hello world"');
+    assert.ok(!allSse.includes('[Error]'), 'Post-content error must not append [Error] text');
+    assert.strictEqual(chatCalls, 1, `Post-content must NOT handoff (expected 1 chat call, got ${chatCalls})`);
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('SSE data.error quota_limit on all accounts: max 1 handoff then terminal error', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAccounts = [...accounts];
+
+  accounts.push(makeAcct('ql-de-max1@test.dev'));
+  accounts.push(makeAcct('ql-de-max2@test.dev'));
+  rebuildEmailIndex();
+
+  let chatCalls = 0;
+  (globalThis as any).fetch = async (input: any, init?: any) => {
+    const url = typeof input === 'string' ? input : input.url;
+    if (url.includes('/api/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'qwen3.6-plus', owned_by: 'qwen' }] }), { status: 200 });
+    }
+    if (url.includes('/api/v2/chat/completions')) {
+      chatCalls++;
+      return new Response(DATA_ERROR_QUOTA_LINE, {
+        status: 200,
+        headers: { 'Content-Type': 'text/event-stream' },
+      });
+    }
+    return originalFetch(input, init);
+  };
+
+  try {
+    const req = new Request('http://localhost/v1/chat/completions', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders),
+      body: JSON.stringify({
+        model: 'qwen3.6-plus',
+        messages: [{ role: 'user', content: 'hello' }],
+        stream: true,
+      }),
+    });
+
+    const res = await app.fetch(req);
+    assert.strictEqual(res.status, 502);
+    const body = await res.json();
+    assert.match(body.error.message, /quota_limit/i);
+    assert.strictEqual(chatCalls, 2, `Expected exactly 2 chat calls (max 1 handoff), got ${chatCalls}`);
+  } finally {
+    accounts.length = 0;
+    accounts.push(...originalAccounts);
+    rebuildEmailIndex();
+    globalThis.fetch = originalFetch;
+  }
+});

@@ -240,7 +240,14 @@ export function parseQwenErrorPayload(raw: string): {
     }
     if (payload && payload.error) {
       const msg = typeof payload.error === 'string' ? payload.error : payload.error.message || JSON.stringify(payload.error);
-      return { message: `Qwen upstream error: ${msg}`, status: 502 };
+      // Preserve the semantic code when the envelope carries it (e.g.
+      // {"error":{"code":"quota_limit",...}}) so callers can route on it.
+      // Absent code stays undefined — identical to previous behavior.
+      const code =
+        typeof payload.error === 'object' && payload.error !== null && typeof payload.error.code === 'string'
+          ? payload.error.code
+          : undefined;
+      return { message: `Qwen upstream error: ${msg}`, status: 502, code };
     }
   } catch {
     return null;

@@ -580,3 +580,122 @@ test('finished chunk with content delta (no local_tool) preserves content', asyn
   const delta = parsed.choices?.[0]?.delta;
   assert.strictEqual(delta?.content, 'Final sentence of the response.', 'content text must match the delta payload');
 });
+
+// ── data.error semantic code preservation (quota_limit failover RCA) ──
+
+function makeStreamState(): StreamProcessingState {
+  return {
+    targetResponseId: null,
+    nextParentId: null,
+    completionTokens: 0,
+    promptTokens: 0,
+    currentThoughtIndex: 0,
+    reasoningBuffer: '',
+    lastFullContent: '',
+    lastRawContent: '',
+    lastFilteredSnapshot: '',
+    lastThinkingSnapshot: '',
+    lastVStrRaw: '',
+    lastFilteredFullContent: '',
+    lastDeltaThinkingFull: '',
+    loggedToolCalls: new Set(),
+    lastParsePosition: 0,
+    toolCallDepth: 0,
+    pendingChunk: '',
+    hasEmittedContent: false,
+  };
+}
+
+function makeStreamCtx(logId: string, completionId: string): StreamProcessingCtx {
+  return {
+    streamWriter: { write: async () => {} },
+    completionId,
+    model: 'qwen3.8-max',
+    emittedToolCallCount: 0,
+    enableContentFiltering: false,
+    cleanOutput: true,
+    logId,
+    resolvedEmail: 'test@example.com',
+    ampState: { rawInputBytes: 0, emittedOutputBytes: 0, triggered: false },
+    qwenAbortController: new AbortController(),
+  };
+}
+
+test('processStreamData preserves code from data.error quota_limit envelope (incident shape)', async () => {
+  const logId = 'test-data-error-quota-limit';
+  logStore.createEntry(logId, 'qwen3.8-max', true);
+  const state = makeStreamState();
+  const ctx = makeStreamCtx(logId, 'test-data-error-quota-limit');
+
+  // Exact upstream envelope observed in the 2026-09-06 incident
+  const data = {
+    error: {
+      code: 'quota_limit',
+      details: 'The service is currently experiencing high demand. Please try again later.',
+    },
+  };
+
+  const result = await processStreamData(data, state, ctx);
+
+  assert.strictEqual(result, 'break_stream', 'error chunk must stop the stream');
+  assert.strictEqual(state.upstreamCode, 'quota_limit', 'UPSTREAM_CODE must be quota_limit');
+  assert.strictEqual(
+    state.upstreamError,
+    'Qwen upstream error: {"code":"quota_limit","details":"The service is currently experiencing high demand. Please try again later."}',
+    'wire/log message must stay byte-compatible with previous behavior',
+  );
+  assert.strictEqual(state.hasEmittedContent, false, 'HAS_EMITTED_CONTENT must be false (pre-content)');
+});
+
+test('processStreamData without code stays compatible (no upstreamCode)', async () => {
+  const logId = 'test-data-error-no-code';
+  logStore.createEntry(logId, 'qwen3.8-max', true);
+  const state = makeStreamState();
+  const ctx = makeStreamCtx(logId, 'test-data-error-no-code');
+
+  const result = await processStreamData({ error: { message: 'boom' } }, state, ctx);
+
+  assert.strictEqual(result, 'break_stream');
+  assert.strictEqual(state.upstreamCode, undefined, 'absent code must stay undefined');
+  assert.strictEqual(state.upstreamError, 'Qwen upstream error: boom');
+});
+
+test('processStreamData string error stays compatible (no upstreamCode)', async () => {
+  const logId = 'test-data-error-string';
+  logStore.createEntry(logId, 'qwen3.8-max', true);
+  const state = makeStreamState();
+  const ctx = makeStreamCtx(logId, 'test-data-error-string');
+
+  const result = await processStreamData({ error: 'plain failure' }, state, ctx);
+
+  assert.strictEqual(result, 'break_stream');
+  assert.strictEqual(state.upstreamCode, undefined, 'string errors carry no code');
+  assert.strictEqual(state.upstreamError, 'Qwen upstream error: plain failure');
+});
+
+test('parseQwenErrorPayload preserves code from payload.error envelope', async () => {
+  const { parseQwenErrorPayload } = await import('./chatHelpersCore.ts');
+
+  const parsed = parseQwenErrorPayload(
+    'data: {"error":{"code":"quota_limit","details":"The service is currently experiencing high demand. Please try again later."}}',
+  );
+
+  assert.ok(parsed, 'envelope must parse');
+  assert.strictEqual(parsed.code, 'quota_limit', 'SEMANTIC_CODE must be preserved');
+  assert.strictEqual(
+    parsed.message,
+    'Qwen upstream error: {"code":"quota_limit","details":"The service is currently experiencing high demand. Please try again later."}',
+    'message must stay byte-compatible',
+  );
+  assert.strictEqual(parsed.status, 502);
+});
+
+test('parseQwenErrorPayload without code stays compatible', async () => {
+  const { parseQwenErrorPayload } = await import('./chatHelpersCore.ts');
+
+  const parsed = parseQwenErrorPayload('data: {"error":{"message":"boom"}}');
+
+  assert.ok(parsed, 'envelope must parse');
+  assert.strictEqual(parsed.code, undefined, 'absent code must stay undefined');
+  assert.strictEqual(parsed.message, 'Qwen upstream error: boom');
+});

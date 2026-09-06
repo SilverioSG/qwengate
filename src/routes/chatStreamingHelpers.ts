@@ -197,6 +197,12 @@ export async function processStreamData(data: any, state: StreamProcessingState,
   // Check for upstream Qwen error sent as SSE data chunk
   if (data.error) {
     const errMsg = typeof data.error === 'string' ? data.error : data.error.message || JSON.stringify(data.error);
+    // Preserve the semantic error code (e.g. quota_limit) when the envelope
+    // carries it as an object — otherwise pre-content failover in setupSession
+    // can never route on it (upstreamCode stays undefined).
+    if (typeof data.error === 'object' && data.error !== null && typeof data.error.code === 'string' && !state.upstreamCode) {
+      state.upstreamCode = data.error.code;
+    }
     logStore.addError(logId, `Qwen upstream SSE error: ${errMsg}`);
     logStore.updateEntry(logId, (entry) => {
       entry.finalResponse = entry.finalResponse || { finishReason: '', toolCallCount: 0, contentPreview: '' };
