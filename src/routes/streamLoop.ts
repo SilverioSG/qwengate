@@ -171,7 +171,7 @@ export async function handlePostStreamCompletion(
     sessionHeaders: any;
     email: string;
     sessionPool: {
-      release: (chatId: string, parentId: string | null, headers: any, email: string) => void;
+      release: (chatId: string, parentId: string | null, headers: any, email: string, isSuccess?: boolean, releasePath?: string) => void;
     };
   },
 ): Promise<void> {
@@ -460,6 +460,16 @@ export async function handlePostStreamCompletion(
     }
   } finally {
     // Always release session to prevent pool exhaustion, even if writeEvent fails
-    scheduleCleanup(reader, heartbeatInterval, chatId, streamState.nextParentId, sessionHeaders, email, sessionPool, true);
+    scheduleCleanup(
+      reader,
+      heartbeatInterval,
+      chatId,
+      streamState.nextParentId,
+      sessionHeaders,
+      email,
+      sessionPool,
+      true,
+      'streaming_final',
+    );
   }
 }

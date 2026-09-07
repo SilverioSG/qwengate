@@ -1,11 +1,4 @@
-import {
-  decrementInFlight,
-  getAccountByEmail,
-  getAllAccountEmails,
-  incrementTotalRequests,
-  pickAccount,
-  throttleAccount,
-} from './auth.ts';
+import { decrementInFlight, getAccountByEmail, getAllAccountEmails, incrementTotalRequests, pickAccount, throttleAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { config } from './configService.ts';
 import { logStore } from './logStore.ts';
@@ -21,6 +14,17 @@ interface PoolEntry {
   accountEmail?: string;
 }
 
+export interface ActiveSessionDetails {
+  chatId: string;
+  accountEmail?: string;
+  acquiredAt: number;
+  acquireCaller: string;
+  acquirePath: string;
+  releasedAt?: number;
+  releasePath?: string;
+  ageMs: number;
+}
+
 export function formatQwenEnvelopeError(json: any): string {
   const code = json?.data?.code || json?.code || 'unknown';
   const details = json?.data?.details || json?.details || json?.message || '';
@@ -29,6 +33,7 @@ export function formatQwenEnvelopeError(json: any): string {
 
 export class SessionPool {
   private activeSessions = new Set<string>();
+  private activeSessionDetails = new Map<string, ActiveSessionDetails>();
   private activeCount = 0;
   private releaseTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
@@ -42,10 +47,21 @@ export class SessionPool {
    * Acquire a fresh session. If email is provided, use that specific account.
    * Otherwise, pick the best available account (round-robin, non-throttled).
    */
-  async acquire(email?: string): Promise<PoolEntry> {
+  async acquire(email?: string, acquirePath: string = 'unknown'): Promise<PoolEntry> {
     if (process.env.TEST_MOCK_PLAYWRIGHT) {
       const mockId = process.env.TEST_SESSION_ID || 'mock-session';
-      return { chatId: mockId, parentId: null, inUse: true, accountEmail: 'mock@test' };
+      const accountEmail = 'mock@test';
+      this.activeSessions.add(mockId);
+      this.activeSessionDetails.set(mockId, {
+        chatId: mockId,
+        accountEmail,
+        acquiredAt: Date.now(),
+        acquireCaller: new Error().stack?.split('\n')[2]?.trim() || 'unknown',
+        acquirePath,
+        ageMs: 0,
+      });
+      this.activeCount++;
+      return { chatId: mockId, parentId: null, inUse: true, accountEmail };
     }
 
     const maxAttempts = email ? 1 : Math.max(1, getAllAccountEmails().length);
@@ -79,8 +95,21 @@ export class SessionPool {
           accountEmail: headers.email || resolvedEmail,
         };
         this.activeSessions.add(chatId);
+        const acquiredAt = Date.now();
+        this.activeSessionDetails.set(chatId, {
+          chatId,
+          accountEmail: entry.accountEmail,
+          acquiredAt,
+          acquireCaller: new Error().stack?.split('\n')[2]?.trim() || 'unknown',
+          acquirePath,
+          ageMs: 0,
+        });
         this.activeCount++;
-        logStore.log('info', 'pool', 'Session acquired' + (entry.accountEmail ? ': ' + entry.accountEmail.split('@')[0] : ''));
+        logStore.log(
+          'info',
+          'pool',
+          `Session acquired${entry.accountEmail ? ': ' + entry.accountEmail.split('@')[0] : ''} path=${acquirePath}`,
+        );
         return entry;
       } catch (err: any) {
         lastErr = err;
@@ -105,11 +134,20 @@ export class SessionPool {
     cachedHeaders?: { cookie: string; userAgent: string },
     accountEmail?: string,
     isSuccess: boolean = true,
+    releasePath: string = 'unknown',
   ): Promise<void> {
     // Idempotency guard: if chatId not tracked as active, this session was already released.
     // Prevents double-release from competing cleanup paths (setTimeout + finally).
     if (!this.activeSessions.has(chatId)) {
       return;
+    }
+
+    const releasedAt = Date.now();
+    const details = this.activeSessionDetails.get(chatId);
+    if (details) {
+      details.releasedAt = releasedAt;
+      details.releasePath = releasePath;
+      details.ageMs = releasedAt - details.acquiredAt;
     }
 
     // Track completed request — decrement in-flight, bump total count
@@ -122,6 +160,7 @@ export class SessionPool {
     }
 
     this.activeSessions.delete(chatId);
+    this.activeSessionDetails.delete(chatId);
     if (this.activeCount > 0) this.activeCount--;
     const existingTimer = this.releaseTimers.get(chatId);
     if (existingTimer) clearTimeout(existingTimer);
@@ -132,7 +171,11 @@ export class SessionPool {
     if (typeof timer.unref === 'function') timer.unref();
     this.releaseTimers.set(chatId, timer);
 
-    logStore.log('info', 'pool', 'Session released' + (accountEmail ? ': ' + accountEmail.split('@')[0] : ''));
+    logStore.log(
+      'info',
+      'pool',
+      `Session released${accountEmail ? ': ' + accountEmail.split('@')[0] : ''} chatId=${chatId} path=${releasePath} acquiredAt=${details?.acquiredAt || 'unknown'} releasedAt=${releasedAt} ageMs=${details?.ageMs ?? 'unknown'}`,
+    );
   }
 
   async deleteSession(chatId: string, cachedHeaders?: { cookie: string; userAgent: string }, accountEmail?: string): Promise<void> {
@@ -176,12 +219,16 @@ export class SessionPool {
     }
   }
 
-  getStats(): { total: number; available: number; inUse: number; waiting: number } {
+  getStats(): { total: number; available: number; inUse: number; waiting: number; activeDetails: ActiveSessionDetails[] } {
     return {
       total: this.activeSessions.size,
       available: this.activeSessions.size - this.activeCount,
       inUse: this.activeCount,
       waiting: 0,
+      activeDetails: [...this.activeSessionDetails.values()].map((details) => ({
+        ...details,
+        ageMs: Date.now() - details.acquiredAt,
+      })),
     };
   }
 

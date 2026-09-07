@@ -113,6 +113,7 @@ async function setupSession(
   toolCalling: boolean,
   logId: string,
   initialExcludeEmail?: string,
+  acquirePath: string = 'unknown',
 ) {
   // ── Image detection ──────────────────────────────────────────
   // Only scan the LAST message — previous turns already uploaded their images
@@ -267,7 +268,7 @@ async function setupSession(
 
     let sessionResult;
     try {
-      sessionResult = await acquireSessionWithCorrections(accountEmail, processedMessages);
+      sessionResult = await acquireSessionWithCorrections(accountEmail, processedMessages, acquirePath);
     } catch (err) {
       lastFailedEmail = accountEmail;
       lastError = err;
@@ -303,7 +304,7 @@ async function setupSession(
       );
     } catch (err: any) {
       // Release the acquired session to prevent pool exhaustion + inFlight leak
-      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'stream_creation_error');
 
       logStore.log(
         'debug',
@@ -381,7 +382,7 @@ async function setupSession(
       logStore.addError(logId, `First-chunk timeout for ${resolvedEmail}`);
       streamReader.cancel().catch(() => {});
       qwenAbortController?.abort();
-      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'first_chunk_timeout');
       lastFailedEmail = resolvedEmail;
       lastError = timeoutErr as Error;
       continue;
@@ -400,7 +401,7 @@ async function setupSession(
           logStore.log('warn', 'chat', `[Chat] Mid-payload RateLimited on ${resolvedEmail} (${routedModel}) — rotating account`);
           streamReader.cancel().catch(() => {});
           qwenAbortController?.abort();
-          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'first_chunk_rate_limit');
           lastFailedEmail = resolvedEmail;
           lastError = new QwenUpstreamError(wall.message, 'RateLimited', 429);
           continue;
@@ -417,7 +418,7 @@ async function setupSession(
           logStore.log('warn', 'chat', `[Chat] Pre-emission quota_limit on ${resolvedEmail} (${routedModel}) — rotating account`);
           streamReader.cancel().catch(() => {});
           qwenAbortController?.abort();
-          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'first_chunk_quota');
           lastFailedEmail = resolvedEmail;
           lastError = new QwenUpstreamError(wall.message, 'quota_limit', 502);
           continue;
@@ -432,25 +433,25 @@ async function setupSession(
         const alternative = await pickAccount(resolvedEmail);
         if (alternative) {
           decrementInFlight(alternative.email);
-          logStore.log('warn', 'chat', `[Chat] First-chunk CAPTCHA on ${resolvedEmail} (${routedModel}) — throttled 5min, rotating account`);
+          logStore.log(
+            'warn',
+            'chat',
+            `[Chat] First-chunk CAPTCHA on ${resolvedEmail} (${routedModel}) — throttled 5min, rotating account`,
+          );
           streamReader.cancel().catch(() => {});
           qwenAbortController?.abort();
-          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'first_chunk_captcha');
           lastFailedEmail = resolvedEmail;
           lastError = new RetryableQwenStreamError(wall.message, 3000);
           continue;
         }
-        logStore.log(
-          'warn',
-          'chat',
-          `[Chat] First-chunk CAPTCHA on ${resolvedEmail} (${routedModel}) — no alternative account available`,
-        );
+        logStore.log('warn', 'chat', `[Chat] First-chunk CAPTCHA on ${resolvedEmail} (${routedModel}) — no alternative account available`);
       } else if (wall) {
         // Other upstream errors (internal_error, etc.) in first chunk — rotate pre-content
         logStore.log('warn', 'chat', `[Chat] First-chunk upstream error on ${resolvedEmail}: ${wall.code} — rotating account`);
         streamReader.cancel().catch(() => {});
         qwenAbortController?.abort();
-        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'generic_first_chunk_error');
         lastFailedEmail = resolvedEmail;
         lastError = new QwenUpstreamError(wall.message, wall.code || 'UpstreamError', wall.status || 502);
         continue;
@@ -581,6 +582,8 @@ export async function chatCompletions(c: Context) {
           contextCheck.availableTokens!,
           toolCalling,
           logId,
+          undefined,
+          'openai_non_stream',
         );
         const completionId = 'chatcmpl-' + crypto.randomUUID();
         try {
@@ -619,6 +622,8 @@ export async function chatCompletions(c: Context) {
       contextCheck.availableTokens!,
       toolCalling,
       logId,
+      undefined,
+      'openai_stream',
     );
     const completionId = 'chatcmpl-' + crypto.randomUUID();
 
@@ -643,7 +648,15 @@ export async function chatCompletions(c: Context) {
         if (!probe) return null;
         decrementInFlight(probe.email);
         try {
-          const retry = await setupSession(messages, body, contextCheck.availableTokens!, toolCalling, logId, excludeEmail);
+          const retry = await setupSession(
+            messages,
+            body,
+            contextCheck.availableTokens!,
+            toolCalling,
+            logId,
+            excludeEmail,
+            'openai_handoff_new_session',
+          );
           return {
             session: retry.session,
             nextParentId: retry.nextParentId,

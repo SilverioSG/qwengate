@@ -133,6 +133,7 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
             current.resolvedEmail,
             sessionPool,
             false,
+            'stream_idle_timeout',
           );
           streamReleased = true;
           return;
@@ -183,7 +184,14 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
             } catch {
               /* best-effort */
             }
-            sessionPool.release(current.session.chatId, streamState.nextParentId, current.sessionHeaders, current.resolvedEmail, false);
+            sessionPool.release(
+              current.session.chatId,
+              streamState.nextParentId,
+              current.sessionHeaders,
+              current.resolvedEmail,
+              false,
+              'handoff_old_session',
+            );
             // A's upstream error must not poison B's outcome in monitor/store.
             logStore.updateEntry(logId, (entry: any) => {
               entry.errors = (entry.errors || []).filter((e: string) => !e.startsWith('Qwen upstream SSE error:'));
@@ -254,6 +262,7 @@ export async function handleStreamingRequest(ctx: StreamingContext): Promise<Res
           current.resolvedEmail,
           sessionPool,
           false,
+          'streaming_finally',
         );
       }
     }

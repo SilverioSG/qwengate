@@ -253,6 +253,7 @@ export async function getModelSpecs(body: any): Promise<{ maxContext: number; ma
 export async function acquireSessionWithCorrections(
   accountEmail: string | undefined,
   qwenMessages: QwenMessage[],
+  acquirePath: string = 'unknown',
 ): Promise<{
   session: any;
   qwenMessages: QwenMessage[];
@@ -260,7 +261,7 @@ export async function acquireSessionWithCorrections(
   sessionHeaders: any;
   resolvedEmail: string;
 }> {
-  const session = await sessionPool.acquire(accountEmail);
+  const session = await sessionPool.acquire(accountEmail, acquirePath);
   const prevCorrections =
     pendingCorrections.get(session.chatId) ||
     (accountEmail ? pendingCorrections.get(accountEmail) : undefined) ||

@@ -414,7 +414,7 @@ async function setupAnthropicSession(
 
     let sessionResult;
     try {
-      sessionResult = await acquireSessionWithCorrections(accountEmail, processedMessages);
+      sessionResult = await acquireSessionWithCorrections(accountEmail, processedMessages, 'anthropic_stream');
     } catch (err) {
       lastFailedEmail = accountEmail;
       lastError = err;
@@ -450,7 +450,7 @@ async function setupAnthropicSession(
         body.tool_choice,
       );
     } catch (err: any) {
-      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'stream_creation_error');
       logStore.log(
         'warn',
         'chat',
@@ -518,7 +518,7 @@ async function setupAnthropicSession(
       logStore.addError(logId, `First-chunk timeout for ${resolvedEmail}`);
       streamReader.cancel().catch(() => {});
       qwenAbortController?.abort();
-      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'anthropic_timeout');
       lastFailedEmail = resolvedEmail;
       lastError = timeoutErr as Error;
       continue;
@@ -1001,7 +1001,7 @@ export async function handleAnthropicStream(
         });
         streamReleased = true;
         logStore.finalizeRequest(logId, { finishReason: 'upstream_error' });
-        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'anthropic_stream_error');
         return;
       }
 
@@ -1069,7 +1069,7 @@ export async function handleAnthropicStream(
         });
         streamReleased = true;
         logStore.finalizeRequest(logId, { finishReason: EMPTY_UPSTREAM_CODE });
-        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+        sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'anthropic_stream_error');
         return;
       }
       // Close text or thinking block
@@ -1148,7 +1148,7 @@ export async function handleAnthropicStream(
         },
         finishReason: stopReason,
       });
-      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail);
+      sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, true, 'anthropic_success');
     } catch (streamErr: any) {
       logStore.addError(logId, streamErr.message || String(streamErr));
     } finally {
@@ -1158,7 +1158,7 @@ export async function handleAnthropicStream(
           finishReason: 'error',
         });
         try {
-          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false);
+          sessionPool.release(session.chatId, nextParentId, sessionHeaders, resolvedEmail, false, 'anthropic_finally');
         } catch {
           /* ignore */
         }
