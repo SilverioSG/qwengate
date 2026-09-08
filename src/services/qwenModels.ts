@@ -9,6 +9,46 @@ import { QWEN_API_BASE, QWEN_CHATS_URL, QWEN_MODELS_URL, QWEN_SETTINGS_URL } fro
 
 export { DEFAULT_SYSTEM_PROMPT };
 
+/**
+ * Client-hint profile for GET /api/models — coherent with the wreq chrome_142
+ * transport and the main chat path (qwen.ts) / chats/new (sessionPool.ts).
+ * The WAF challenges this endpoint when UA + client hints are absent (A/B verified).
+ */
+export const MODELS_CLIENT_HINTS = {
+  'sec-ch-ua': '"Chromium";v="142", "Google Chrome";v="142", "Not?A_Brand";v="99"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Linux"',
+} as const;
+
+/** Canonical GET /api/models request shape. */
+export interface ModelsRequest {
+  url: string;
+  method: 'GET';
+  headers: Record<string, string>;
+}
+
+/**
+ * Build the canonical models request. Cookie handling is unchanged
+ * (token-only passthrough); bx-* injection stays in browserlessFetch.
+ * userAgent comes from getBasicHeaders() (centralized, dynamic).
+ */
+export function buildModelsRequest(cookieStr: string, userAgent: string): ModelsRequest {
+  return {
+    url: QWEN_MODELS_URL,
+    method: 'GET',
+    headers: {
+      accept: 'application/json, text/plain, */*',
+      source: 'web',
+      origin: QWEN_API_BASE,
+      referer: 'https://chat.qwen.ai/',
+      ...(cookieStr ? { cookie: cookieStr } : {}),
+      // WAF fix: real browser UA + coherent client hints.
+      'user-agent': userAgent,
+      ...MODELS_CLIENT_HINTS,
+    },
+  };
+}
+
 async function postQwenSettings(
   email: string | undefined,
   payload: Record<string, unknown>,
@@ -166,7 +206,8 @@ export async function fetchQwenModels(): Promise<any[]> {
     return cachedModels;
   }
 
-  const { email: resolvedEmail } = await getBasicHeaders();
+  const basic = await getBasicHeaders();
+  const resolvedEmail = basic.email;
   if (resolvedEmail) decrementInFlight(resolvedEmail);
 
   const tokenInfo = resolvedEmail ? await getTokenWithAccount(resolvedEmail) : null;
@@ -177,15 +218,10 @@ export async function fetchQwenModels(): Promise<any[]> {
     try {
       if (attempt > 0) await new Promise((r) => setTimeout(r, 500 * attempt));
 
-      const response = await browserlessFetch(QWEN_MODELS_URL, {
-        method: 'GET',
-        headers: {
-          accept: 'application/json, text/plain, */*',
-          source: 'web',
-          origin: QWEN_API_BASE,
-          referer: 'https://chat.qwen.ai/',
-          ...(cookieStr ? { cookie: cookieStr } : {}),
-        },
+      const req = buildModelsRequest(cookieStr, basic.userAgent);
+      const response = await browserlessFetch(req.url, {
+        method: req.method,
+        headers: req.headers,
         accountEmail: resolvedEmail,
       });
 
