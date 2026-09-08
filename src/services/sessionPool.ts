@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { decrementInFlight, getAccountByEmail, getAllAccountEmails, incrementTotalRequests, pickAccount, throttleAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { config } from './configService.ts';
@@ -29,6 +30,67 @@ export function formatQwenEnvelopeError(json: any): string {
   const code = json?.data?.code || json?.code || 'unknown';
   const details = json?.data?.details || json?.details || json?.message || '';
   return details ? `${code}: ${details}` : String(code);
+}
+
+/** Canonical POST /api/v2/chats/new request shape (observed from the real SPA). */
+export interface ChatsNewRequest {
+  url: string;
+  method: 'POST';
+  headers: Record<string, string>;
+  body: string;
+}
+
+/** Merge a fresh auth token into existing session cookies without duplicating names. */
+export function mergeChatsNewCookies(existingCookies: string, token: string | null | undefined): string {
+  const kept = (existingCookies || '')
+    .split(';')
+    .map((c) => c.trim())
+    .filter(Boolean)
+    .filter((c) => !/^token=/i.test(c));
+  return token ? [`token=${token}`, ...kept].join('; ') : kept.join('; ');
+}
+
+/** Runtime timezone string in the SPA format (`Tue Sep 08 2026 21:56:53 GMT+0200`). */
+export function getChatsNewTimezone(): string {
+  const match = new Date().toString().match(/^[A-Za-z]{3} [A-Za-z]{3} \d{2} \d{4} \d{2}:\d{2}:\d{2} GMT[+-]\d{4}/);
+  return match ? match[0] : '';
+}
+
+/**
+ * Build the canonical chats/new request validated against the real SPA via wreq A/B.
+ * Preserves BasicHeaders session cookies (merged with the fresh token) and never
+ * sends bx-pp/bx-et — the real SPA does not send them on this endpoint.
+ */
+export function buildChatsNewRequest(
+  headers: BasicHeaders,
+  opts: { token?: string | null; flagship?: boolean; now?: number },
+): ChatsNewRequest {
+  const body = JSON.stringify({
+    chatId: '',
+    models: [opts.flagship ? 'qwen3.7-plus' : 'qwen3.5-flash'],
+    project_id: '',
+    timestamp: opts.now ?? Date.now(),
+    chat_type: 't2t',
+    chat_mode: 'normal',
+  });
+  const timezone = getChatsNewTimezone();
+  const reqHeaders: Record<string, string> = {
+    'content-type': 'application/json',
+    accept: 'application/json, text/plain, */*',
+    source: 'web',
+    cookie: mergeChatsNewCookies(headers.cookie, opts.token),
+    referer: 'https://chat.qwen.ai/c/new-chat',
+    // Aligned with the wreq chrome_142 profile and the main chat path (qwen.ts)
+    'sec-ch-ua': '"Chromium";v="142", "Google Chrome";v="142", "Not?A_Brand";v="99"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Linux"',
+    'user-agent': headers.userAgent,
+    'x-request-id': crypto.randomUUID(),
+    'accept-language': 'en-US,en;q=0.9',
+  };
+  if (timezone) reqHeaders.timezone = timezone;
+  if (headers.bxV) reqHeaders['bx-v'] = headers.bxV;
+  return { url: `${QWEN_API_BASE}/api/v2/chats/new`, method: 'POST', headers: reqHeaders, body };
 }
 
 export class SessionPool {
@@ -238,29 +300,16 @@ export class SessionPool {
   private async createSessionWithHeaders(email: string | undefined, headers: BasicHeaders): Promise<string> {
     const acct = email ? getAccountByEmail(email) : null;
 
-    const sessionBody = JSON.stringify({
-      title: 'New Chat',
-      models: [acct?.state?.token ? 'qwen3.7-plus' : 'qwen3.5-flash'],
-      chat_mode: 'normal',
-      chat_type: 't2t',
-      timestamp: Date.now(),
-      project_id: '',
+    const tokenInfo = email ? await import('./auth.ts').then((m) => m.getTokenWithAccount(email!)) : null;
+    const req = buildChatsNewRequest(headers, {
+      token: tokenInfo?.token ?? null,
+      flagship: !!acct?.state?.token,
     });
 
-    const tokenInfo = email ? await import('./auth.ts').then((m) => m.getTokenWithAccount(email!)) : null;
-    const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
-
-    const response = await browserlessFetch(`${QWEN_API_BASE}/api/v2/chats/new`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        accept: 'application/json, text/plain, */*',
-        source: 'web',
-        cookie: cookieStr,
-        origin: QWEN_API_BASE,
-        referer: 'https://chat.qwen.ai/',
-      },
-      body: sessionBody,
+    const response = await browserlessFetch(req.url, {
+      method: req.method,
+      headers: req.headers,
+      body: req.body,
       accountEmail: email,
     });
 
