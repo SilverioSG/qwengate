@@ -111,13 +111,31 @@ async function closeBrowser(): Promise<void> {
 
 const COOKIE_REFRESH_TTL_MS = 30 * 60 * 1000; // 30 min
 
+export interface BrowserRefreshCookie {
+  name: string;
+  value: string;
+  domain?: string;
+  path?: string;
+  secure?: boolean;
+}
+
+function cookieMatchesUrl(cookie: BrowserRefreshCookie, requestUrl: string): boolean {
+  const url = new URL(requestUrl);
+  const domain = cookie.domain?.toLowerCase().replace(/^\./, '');
+  const hostname = url.hostname.toLowerCase();
+  const domainMatches = !domain || hostname === domain || hostname.endsWith(`.${domain}`);
+  const path = cookie.path || '/';
+  const pathMatches = url.pathname === path || url.pathname.startsWith(path.endsWith('/') ? path : `${path}/`);
+  return domainMatches && pathMatches && (cookie.secure !== false ? url.protocol === 'https:' : true);
+}
+
 /**
  * Refresh cookies for an account by navigating chat.qwen.ai in a real browser.
  *
  * @param cookieStr - Current saved cookies (may be stale)
  * @returns Fresh cookie string or null
  */
-export async function refreshCookiesViaBrowser(cookieStr: string): Promise<string | null> {
+export async function refreshCookiesViaBrowser(cookieStr: string, requestUrl: string = QWEN_API_BASE): Promise<string | null> {
   let page: any = null;
   try {
     const browser = await getBrowser();
@@ -136,20 +154,23 @@ export async function refreshCookiesViaBrowser(cookieStr: string): Promise<strin
 
     await page.goto(QWEN_API_BASE, { waitUntil: 'load', timeout: 25_000 }).catch(() => {});
     // Wait for WAF challenge to resolve (up to 15s)
+    let challengePresent = false;
     for (let i = 0; i < 15; i++) {
       const html = await page.evaluate(() => document.documentElement?.innerHTML || '').catch(() => '');
-      if (!html.includes('aliyun_waf')) break;
+      challengePresent = html.includes('aliyun_waf');
+      if (!challengePresent) break;
       await new Promise((r) => setTimeout(r, 1000));
     }
 
-    const freshCookies = await page.context().cookies();
-    const cookieMap = new Map<string, string>();
-    for (const c of freshCookies) {
-      cookieMap.set(c.name, c.value);
+    if (challengePresent) {
+      logStore.log('warn', 'fireyejs', 'Cookie refresh via browser stopped while WAF challenge was still present');
+      return null;
     }
 
-    const freshCookieStr = Array.from(cookieMap.entries())
-      .map(([n, v]) => `${n}=${v}`)
+    const freshCookies = await page.context().cookies();
+    const applicableCookies = freshCookies.filter((cookie: BrowserRefreshCookie) => cookieMatchesUrl(cookie, requestUrl));
+    const freshCookieStr = applicableCookies
+      .map((cookie: BrowserRefreshCookie) => `${cookie.name}=${cookie.value}`)
       .join('; ');
 
     if (freshCookieStr) {

@@ -27,6 +27,15 @@ const cookieRefreshInFlight = new Map<string, Promise<string | null>>();
 const BX_UMIDTOKEN_TTL_MS = 4 * 60 * 60 * 1000;
 const BX_UA_TTL_MS = 15 * 60 * 1000;
 
+function replaceCookie(headers: Record<string, string>, name: string, value: string): void {
+  const cookies = (headers.cookie || '')
+    .split(';')
+    .map((cookie) => cookie.trim())
+    .filter(Boolean)
+    .filter((cookie) => !cookie.startsWith(`${name}=`));
+  headers.cookie = [...cookies, `${name}=${value}`].join('; ');
+}
+
 export interface BrowserlessFetchOptions {
   method?: string;
   headers?: Record<string, string>;
@@ -194,8 +203,20 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       const currentCookie = headers['cookie'] || '';
 
       const freshAcwTc = await refreshAcwTcCookie();
-      if (freshAcwTc && !currentCookie.includes('acw_tc=')) {
-        headers['cookie'] = currentCookie ? `${currentCookie}; acw_tc=${freshAcwTc}` : `acw_tc=${freshAcwTc}`;
+      if (freshAcwTc) {
+        replaceCookie(headers, 'acw_tc', freshAcwTc);
+        logFetchCall('browserlessFetch.http-refresh', url, method);
+        const refreshedResponse = await wreqFetch(url, {
+          method,
+          headers,
+          body,
+          signal,
+          stream: !!stream,
+          debugLogDir: process.env.DEBUG_IMPERS_DIR,
+        });
+        logFetchCall('browserlessFetch.http-refresh', url, method, refreshedResponse.status);
+        if (!wafCheck(refreshedResponse)) return refreshedResponse;
+        response = refreshedResponse;
       }
 
       const responseText = await response.text().catch(() => '');
@@ -209,7 +230,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       const key = accountEmail || '_default_';
       let promise = cookieRefreshInFlight.get(key);
       if (!promise) {
-        promise = refreshCookiesViaBrowser(currentCookie).finally(() => {
+        promise = refreshCookiesViaBrowser(currentCookie, url).finally(() => {
           cookieRefreshInFlight.delete(key);
         });
         cookieRefreshInFlight.set(key, promise);
