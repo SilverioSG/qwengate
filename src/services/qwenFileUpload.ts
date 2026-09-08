@@ -1,8 +1,18 @@
 import crypto from 'node:crypto';
-import { getTokenWithAccount } from './auth.ts';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { logStore } from './logStore.ts';
+import { getBasicHeaders } from './playwright.ts';
 import { QWEN_API_BASE } from './qwen.ts';
+import { buildQwenBrowserHeaders } from './qwenHeaders.ts';
+
+export function buildFileApiRequest(url: string, cookie: string, userAgent: string, body: string) {
+  return {
+    url,
+    method: 'POST' as const,
+    headers: buildQwenBrowserHeaders(cookie, { method: 'POST', userAgent, contentType: 'application/json' }),
+    body,
+  };
+}
 
 /**
  * Character limit enforced by Qwen on message content.
@@ -77,18 +87,12 @@ async function getstsToken(email: string, filename: string, filesize: number, fi
     filetype,
   });
 
-  const tokenInfo = await getTokenWithAccount(email);
-  const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
-  const response = await browserlessFetch(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: 'application/json, text/plain, */*',
-      source: 'web',
-      cookie: cookieStr,
-      origin: QWEN_API_BASE,
-    },
-    body,
+  const basic = await getBasicHeaders(email);
+  const req = buildFileApiRequest(url, basic.cookie, basic.userAgent, body);
+  const response = await browserlessFetch(req.url, {
+    method: req.method,
+    headers: req.headers,
+    body: req.body,
     accountEmail: email,
   });
   if (!response.ok) {
@@ -188,18 +192,12 @@ async function parseFile(email: string, fileId: string): Promise<void> {
   const url = `${QWEN_API_BASE}/api/v2/files/parse`;
   const body = JSON.stringify({ file_id: fileId });
 
-  const tokenInfo = await getTokenWithAccount(email);
-  const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
-  const response = await browserlessFetch(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      accept: 'application/json, text/plain, */*',
-      source: 'web',
-      cookie: cookieStr,
-      origin: QWEN_API_BASE,
-    },
-    body,
+  const basic = await getBasicHeaders(email);
+  const req = buildFileApiRequest(url, basic.cookie, basic.userAgent, body);
+  const response = await browserlessFetch(req.url, {
+    method: req.method,
+    headers: req.headers,
+    body: req.body,
     accountEmail: email,
   });
   if (!response.ok) {
@@ -223,18 +221,12 @@ async function pollParseStatus(email: string, fileId: string, maxWaitMs = 5_000)
   while (Date.now() - startTime < maxWaitMs) {
     const body = JSON.stringify({ file_id_list: [fileId] });
 
-    const tokenInfo = await getTokenWithAccount(email);
-    const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
-    const response = await browserlessFetch(url, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        accept: 'application/json, text/plain, */*',
-        source: 'web',
-        cookie: cookieStr,
-        origin: QWEN_API_BASE,
-      },
-      body,
+    const basic = await getBasicHeaders(email);
+    const req = buildFileApiRequest(url, basic.cookie, basic.userAgent, body);
+    const response = await browserlessFetch(req.url, {
+      method: req.method,
+      headers: req.headers,
+      body: req.body,
       accountEmail: email,
     });
     if (response.ok) {
