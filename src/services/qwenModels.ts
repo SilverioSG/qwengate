@@ -49,14 +49,26 @@ export function buildModelsRequest(cookieStr: string, userAgent: string): Models
   };
 }
 
-async function postQwenSettings(
-  email: string | undefined,
-  payload: Record<string, unknown>,
-): Promise<{ response: Response; debugId: string }> {
-  const bodyStr = JSON.stringify(payload);
-  const tokenInfo = email ? await getTokenWithAccount(email) : null;
-  const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
-  const response = await browserlessFetch(QWEN_SETTINGS_URL, {
+/** Canonical POST /api/v2/users/user/settings/update request shape. */
+export interface SettingsRequest {
+  url: string;
+  method: 'POST';
+  headers: Record<string, string>;
+  body: string;
+}
+
+/**
+ * Build the canonical settings/update request. Cookie handling is unchanged
+ * (token-only passthrough, key always present); bx-* injection stays in
+ * browserlessFetch. userAgent comes from getBasicHeaders() (centralized,
+ * dynamic). Only UA + coherent client hints are added — the WAF probes (P1
+ * PASS with UA+CH alone, P2 FAIL with full cookies but no UA) proved nothing
+ * else is needed, so origin/referer/body/bx/version/timezone/lang/x-request-id
+ * stay exactly as before.
+ */
+export function buildSettingsRequest(cookieStr: string, userAgent: string, bodyStr: string): SettingsRequest {
+  return {
+    url: QWEN_SETTINGS_URL,
     method: 'POST',
     headers: {
       'content-type': 'application/json',
@@ -65,8 +77,33 @@ async function postQwenSettings(
       cookie: cookieStr,
       origin: QWEN_API_BASE,
       referer: 'https://chat.qwen.ai/',
+      // WAF fix: real browser UA + coherent client hints (same profile as models).
+      'user-agent': userAgent,
+      ...MODELS_CLIENT_HINTS,
     },
     body: bodyStr,
+  };
+}
+
+async function postQwenSettings(
+  email: string | undefined,
+  payload: Record<string, unknown>,
+): Promise<{ response: Response; debugId: string }> {
+  const bodyStr = JSON.stringify(payload);
+  const tokenInfo = email ? await getTokenWithAccount(email) : null;
+  const cookieStr = tokenInfo ? `token=${tokenInfo.token}` : '';
+  // Centralized UA (chrome_142/Linux). With an explicit email this performs no
+  // pickAccount and touches no inFlight counters; without email we fall back to
+  // the static transport UA instead of picking an account.
+  const basic = email ? await getBasicHeaders(email).catch(() => null) : null;
+  const userAgent =
+    basic?.userAgent ||
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36';
+  const req = buildSettingsRequest(cookieStr, userAgent, bodyStr);
+  const response = await browserlessFetch(req.url, {
+    method: req.method,
+    headers: req.headers,
+    body: req.body,
     accountEmail: email,
   });
   return { response, debugId: 'browserless-' + Date.now() };
