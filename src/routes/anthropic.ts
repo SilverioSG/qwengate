@@ -10,6 +10,7 @@ import { modelRouter } from '../services/modelRouter.ts';
 import { RetryableQwenStreamError } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
 import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
+import { isParseGuardOpenError } from '../services/parseGuard.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { cleanTextOfXmlArtifacts, parseXmlToolCalls, xmlToolCallToParsed } from '../tools/xmlToolParser.ts';
 import type { OpenAIRequest, ParsedToolCall } from '../types/openai.ts';
@@ -398,6 +399,8 @@ async function setupAnthropicSession(
         // loop throws a real error instead of silently sending inline.
         logStore.log('error', 'chat', `[Anthropic] Context file upload failed for ${accountEmail}: ${err.message || err}`);
         if (accountEmail) decrementInFlight(accountEmail);
+        // Breaker de parse abierto: fail-fast sin rotación (ver chat.ts).
+        if (isParseGuardOpenError(err)) throw err;
         lastFailedEmail = accountEmail;
         lastError = err;
         contextUploadFailed = true;

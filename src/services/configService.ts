@@ -30,6 +30,12 @@ export interface ConfigSchema {
   MODELS_CACHE_TTL_MS: string;
   DARK_MODE: string;
   CLAUDE_CODE_PROXY: string;
+  PARSE_GUARD_ENABLED: string;
+  PARSE_MAX_CONCURRENCY: string;
+  PARSE_PACING_MS: string;
+  PARSE_BREAKER_COOLDOWN_MS: string;
+  PARSE_MAX_QUEUE_DEPTH: string;
+  PARSE_MAX_QUEUE_WAIT_MS: string;
 }
 
 export const DEFAULT_CONFIG: ConfigSchema = {
@@ -59,6 +65,12 @@ export const DEFAULT_CONFIG: ConfigSchema = {
   MODELS_CACHE_TTL_MS: '3600000',
   DARK_MODE: 'false',
   CLAUDE_CODE_PROXY: 'false',
+  PARSE_GUARD_ENABLED: 'true',
+  PARSE_MAX_CONCURRENCY: '1',
+  PARSE_PACING_MS: '35000',
+  PARSE_BREAKER_COOLDOWN_MS: '60000',
+  PARSE_MAX_QUEUE_DEPTH: '20',
+  PARSE_MAX_QUEUE_WAIT_MS: '120000',
 };
 
 const CONFIG_KEYS = new Set<string>(Object.keys(DEFAULT_CONFIG));

@@ -35,7 +35,11 @@ function getPort(): number {
 async function startWorker(): Promise<string> {
   return new Promise((resolvePromise, reject) => {
     const port = getPort();
-    const proc = spawn('node', [WORKER_PATH], {
+    // OPERATIVO (paridad quant1): lanzar el worker con el mismo runtime que
+    // ejecuta el gate (process.execPath = Bun bajo `bun start`) en vez de
+    // depender de `spawn('node')`, cuya resolución PATH varía por host
+    // (/usr/bin/node en quant vs shim Bun en quant1). Sin fallback silencioso.
+    const proc = spawn(process.execPath, [WORKER_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, WREQ_WORKER_PORT: String(port) },
     });

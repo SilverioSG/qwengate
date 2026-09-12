@@ -14,6 +14,7 @@ import {
 } from '../services/qwen.ts';
 import type { QwenFileAttachment } from '../services/qwenFileUpload.ts';
 import { uploadImageAsFile, uploadLargeTextAsFile } from '../services/qwenFileUpload.ts';
+import { isParseGuardOpenError } from '../services/parseGuard.ts';
 import { sessionPool } from '../services/sessionPool.ts';
 import { cleanTextOfXmlArtifacts } from '../tools/xmlToolParser.ts';
 import { OpenAIRequest } from '../types/openai.ts';
@@ -251,6 +252,9 @@ async function setupSession(
         // loop throws a real error instead of silently sending inline.
         logStore.log('error', 'chat', `[Chat] Context file upload failed for ${accountEmail}: ${err.message || err}`);
         if (accountEmail) decrementInFlight(accountEmail);
+        // Breaker de parse abierto: fail-fast sin rotación (rotar no ayuda:
+        // el guard rechazaría cada cuenta sin tocar upstream).
+        if (isParseGuardOpenError(err)) throw err;
         lastFailedEmail = accountEmail;
         lastError = err;
         contextUploadFailed = true;

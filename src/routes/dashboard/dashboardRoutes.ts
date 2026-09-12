@@ -8,6 +8,7 @@ import { logStore } from '../../services/logStore.ts';
 import { monitorStore } from '../../services/monitorStore.ts';
 
 import { configureAccount, deleteAllChats } from '../../services/qwen.ts';
+import { parseGuard } from '../../services/parseGuard.ts';
 import { sessionPool } from '../../services/sessionPool.ts';
 import { checkApiKeyAuth } from '../../utils/auth.ts';
 import { projectPath } from '../../utils/paths.ts';
@@ -342,6 +343,7 @@ export function registerDashboardRoutes(app: Hono): void {
   app.get('/system/logs', async (c, next) => requireApiKey(c, next), systemLogsHandler);
   app.get('/metrics/model-health', async (c, next) => requireApiKey(c, next), modelHealthHandler);
   app.get('/metrics/monitor', async (c, next) => requireApiKey(c, next), monitorHandler);
+  app.get('/metrics/parse-guard', async (c, next) => requireApiKey(c, next), (c) => c.json(parseGuard.getMetrics()));
 
   app.get('/log', (c) => c.redirect('/dashboard'));
 

@@ -1,9 +1,12 @@
 import crypto from 'node:crypto';
 import { browserlessFetch } from './browserlessFetch.ts';
 import { logStore } from './logStore.ts';
+import { isParseGuardOpenError, parseGuard } from './parseGuard.ts';
 import { getBasicHeaders } from './playwright.ts';
 import { QWEN_API_BASE } from './qwen.ts';
 import { buildQwenBrowserHeaders } from './qwenHeaders.ts';
+
+export { isParseGuardOpenError };
 
 export function buildFileApiRequest(url: string, cookie: string, userAgent: string, body: string) {
   return {
@@ -272,25 +275,34 @@ async function uploadFileContent(
 
   logStore.log('debug', 'upload', `[FileUpload] Uploading ${fileSize} bytes as "${fileName}" (${contentType}) for ${email}`);
 
-  // Step 1: Get STS credentials
-  const sts = await getstsToken(email, fileName, fileSize, filetype);
-  logStore.log(
-    'debug',
-    'upload',
-    `[FileUpload] Got STS token — bucket=${sts.bucketname}, file_id=${sts.file_id}, file_url=${sts.file_url}, endpoint=${sts.endpoint}, file_path=${sts.file_path}`,
-  );
+  // Guard global solo para pipelines que llegan a parse (ficheros, no imágenes):
+  // STS + OSS + parse como una sola unidad serializada con breaker WAF.
+  const needsParse = attachmentType === 'file';
+  const runPipeline = async () => {
+    // Step 1: Get STS credentials
+    const sts = await getstsToken(email, fileName, fileSize, filetype);
+    logStore.log(
+      'debug',
+      'upload',
+      `[FileUpload] Got STS token — bucket=${sts.bucketname}, file_id=${sts.file_id}, file_url=${sts.file_url}, endpoint=${sts.endpoint}, file_path=${sts.file_path}`,
+    );
 
-  // Step 2: Upload to OSS
-  const fileUrl = await uploadToOss(sts, buffer, contentType);
-  logStore.log('debug', 'upload', `[FileUpload] Uploaded to OSS — url=${fileUrl.substring(0, 80)}...`);
+    // Step 2: Upload to OSS
+    const fileUrl = await uploadToOss(sts, buffer, contentType);
+    logStore.log('debug', 'upload', `[FileUpload] Uploaded to OSS — url=${fileUrl.substring(0, 80)}...`);
 
-  // Images don't need server-side parsing — Qwen processes them directly from OSS
-  if (attachmentType === 'file') {
-    // Step 3: Trigger parsing
-    await parseFile(email, sts.file_id);
-    logStore.log('debug', 'upload', `[FileUpload] Parse triggered for ${sts.file_id}`);
+    // Step 3: Trigger parsing (solo ficheros; imágenes no lo necesitan)
+    if (needsParse) {
+      await parseFile(email, sts.file_id);
+      logStore.log('debug', 'upload', `[FileUpload] Parse triggered for ${sts.file_id}`);
+    }
+    return sts;
+  };
 
-    // Step 4: Poll until parsed
+  const sts = needsParse && parseGuard.enabled ? await parseGuard.execute(runPipeline) : await runPipeline();
+
+  if (needsParse) {
+    // Step 4: Poll until parsed (fuera del guard: sondeo ligero, no parse)
     await pollParseStatus(email, sts.file_id);
     logStore.log('debug', 'upload', `[FileUpload] Parse complete for ${sts.file_id}`);
   }

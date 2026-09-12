@@ -15,6 +15,7 @@ import { logCrash, logEvent, logFetchCall } from '../utils/wreqCrashLogger.ts';
 import { extractBxUmidtoken } from './bxTokenExtractor.ts';
 import { generateBxPp, generateBxUa, refreshCookiesViaBrowser } from './fireyejsRunner.ts';
 import { logStore } from './logStore.ts';
+import { parseGuard } from './parseGuard.ts';
 import { QWEN_API_BASE } from './qwen.ts';
 import { tokenCache } from './tokenCache.ts';
 import { disposeWreqWorker, wreqFetch } from './wreqFetch.ts';
@@ -119,6 +120,12 @@ async function ensureAcwTcCookie(headers: Record<string, string>): Promise<void>
 
 // ─── WAF check ──────────────────────────────────────────────────────────────
 
+/** Solo el trigger real de parse (POST exacto a /api/v2/files/parse). Excluye /parse/status. */
+export function isRealParsePost(url: string, method?: string): boolean {
+  if ((method ?? 'GET').toUpperCase() !== 'POST') return false;
+  return /\/api\/v2\/files\/parse$/.test(url.split('?')[0]);
+}
+
 const wafCheck = (r: Response): boolean => {
   if (r.status === 302) return true;
   if (r.status === 403) return true;
@@ -186,6 +193,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
   // ─── Initial request via wreq worker ─────────────────────────────────
   try {
     logFetchCall('browserlessFetch', url, method);
+    if (isRealParsePost(url, method)) await parseGuard.paceParsePost();
     let response = await wreqFetch(url, {
       method,
       headers,
@@ -206,6 +214,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
       if (freshAcwTc) {
         replaceCookie(headers, 'acw_tc', freshAcwTc);
         logFetchCall('browserlessFetch.http-refresh', url, method);
+        if (isRealParsePost(url, method)) await parseGuard.paceParsePost();
         const refreshedResponse = await wreqFetch(url, {
           method,
           headers,
@@ -249,6 +258,7 @@ export async function browserlessFetch(url: string, options: BrowserlessFetchOpt
 
         logEvent('browserlessFetch', 'WAF retry', { url: url.split('?')[0] });
         logFetchCall('browserlessFetch.retry', url, method);
+        if (isRealParsePost(url, method)) await parseGuard.paceParsePost();
         response = await wreqFetch(url, {
           method,
           headers,
